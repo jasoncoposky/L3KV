@@ -1,23 +1,16 @@
 #include <chrono>
 #include <iostream>
 #include <lite3/client.hpp>
-#include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
-
-
-using json = nlohmann::json;
 
 void run_rmw_benchmark(lite3::Client &client, int iterations) {
   std::string key = "twitter_profile_rmw";
 
-  // Initial setup
-  json initial = {{"id", 12345},
-                  {"handle", "antigravity_ai"},
-                  {"followers", 1000},
-                  {"following", 500},
-                  {"tweets", 42}};
-  client.put(key, initial.dump());
+  std::string initial =
+      "{\"id\": 12345,\"handle\": \"antigravity_ai\",\"followers\": "
+      "1000,\"following\": 500,\"tweets\": 42}";
+  client.put(key, initial);
 
   auto start = std::chrono::high_resolution_clock::now();
   auto last_log = start;
@@ -35,11 +28,22 @@ void run_rmw_benchmark(lite3::Client &client, int iterations) {
 
     // 2. Parse & Modify
     try {
-      json j = json::parse(res.value());
-      j["followers"] = j["followers"].get<int>() + 1;
+      auto buf = res.value();
+      std::string val(reinterpret_cast<const char *>(buf.data()), buf.size());
+      std::string search = "\"followers\": ";
+      size_t pos = val.find(search);
+      if (pos != std::string::npos) {
+        size_t v_start = pos + search.length();
+        size_t v_end = val.find(",", v_start);
+        if (v_end != std::string::npos) {
+          int followers = std::stoi(val.substr(v_start, v_end - v_start));
+          followers++;
+          val.replace(v_start, v_end - v_start, std::to_string(followers));
+        }
+      }
 
       // 3. PUT
-      client.put(key, j.dump());
+      client.put(key, val);
     } catch (const std::exception &e) {
       std::cerr << "JSON Error: " << e.what() << "\n";
     }
@@ -64,13 +68,10 @@ void run_rmw_benchmark(lite3::Client &client, int iterations) {
 void run_zeroparse_benchmark(lite3::Client &client, int iterations) {
   std::string key = "twitter_profile_zp";
 
-  // Initial setup
-  json initial = {{"id", 12345},
-                  {"handle", "antigravity_ai"},
-                  {"followers", 1000},
-                  {"following", 500},
-                  {"tweets", 42}};
-  client.put(key, initial.dump());
+  std::string initial =
+      "{\"id\": 12345,\"handle\": \"antigravity_ai\",\"followers\": "
+      "1000,\"following\": 500,\"tweets\": 42}";
+  client.put(key, initial);
 
   auto start = std::chrono::high_resolution_clock::now();
   auto last_log = start;

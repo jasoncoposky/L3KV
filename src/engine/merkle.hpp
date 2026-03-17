@@ -27,19 +27,16 @@
 
 namespace l3kv {
 
-// Simple stable hash (FNV-1a 64-bit)
+#include <xxhash.h>
+
+// Ultra-fast SIMD AVX-accelerated hash (XXH3 64-bit)
+// Replaces FNV-1a for extreme throughput
 inline uint64_t fnv1a_64(const void *data, size_t len) {
-  uint64_t hash = 0xcbf29ce484222325ULL;
-  const uint8_t *ptr = static_cast<const uint8_t *>(data);
-  for (size_t i = 0; i < len; ++i) {
-    hash ^= ptr[i];
-    hash *= 0x100000001b3ULL;
-  }
-  return hash;
+  return XXH3_64bits(data, len);
 }
 
 inline uint64_t fnv1a_64(std::string_view s) {
-  return fnv1a_64(s.data(), s.size());
+  return XXH3_64bits(s.data(), s.size());
 }
 
 class MerkleTree {

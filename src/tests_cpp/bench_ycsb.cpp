@@ -146,7 +146,7 @@ void run_worker(int thread_id, int ops_per_thread, ThreadResult &result,
         if (res) {
           try {
             // Modern API: Wrap buffer in Document
-            lite3cpp::Document doc(std::move(res.value()));
+            lite3cpp::Document doc(lite3cpp::Buffer(std::move(res.value())));
             auto root = doc.root_obj();
 
             // Verify we can read a field using proxy

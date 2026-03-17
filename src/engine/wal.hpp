@@ -3,13 +3,17 @@
 #include "wal_storage.hpp"
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <mutex>
+#include <queue>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace l3kv {
@@ -55,6 +59,15 @@ class WriteAheadLog {
     }
   };
 
+  struct PendingCommit {
+    WalOp op;
+    std::string key;
+    std::string payload;
+    std::vector<BatchOp> batch;
+    bool is_batch;
+    std::promise<bool> promise;
+  };
+
   std::string path_;
   FileHandle file_; // Destroyed LAST (after wal_)
   std::unique_ptr<libconveyor::v2::Conveyor>
@@ -62,6 +75,12 @@ class WriteAheadLog {
 
   std::mutex mx_;
   std::vector<uint8_t> scratch_;
+
+  std::mutex queue_mx_;
+  std::condition_variable queue_cv_;
+  std::queue<std::shared_ptr<PendingCommit>> commit_queue_;
+  bool stop_flusher_ = false;
+  std::thread flusher_thread_;
 
   static uint32_t compute_crc(uint8_t op, std::string_view key,
                               std::string_view payload) {
@@ -80,14 +99,8 @@ class WriteAheadLog {
     return ~crc;
   }
 
-public:
-  explicit WriteAheadLog(std::string path)
-      : path_(std::move(path)), file_(path_) {
-    // Conveyor is initialized in recover() to avoid contention with read loop
-  }
-
-  void append(WalOp op, std::string_view key, std::string_view payload) {
-    std::lock_guard lock(mx_);
+  void append_internal(WalOp op, std::string_view key,
+                       std::string_view payload) {
     uint32_t crc = compute_crc((uint8_t)op, key, payload);
 
     LogHeader h{crc, (uint8_t)op, (uint16_t)key.size(),
@@ -108,10 +121,7 @@ public:
       std::cerr << "WAL Write Error: " << res.error().message() << "\n";
   }
 
-  void append_batch(const std::vector<BatchOp> &ops) {
-    // Serialize batch
-    // [Count:4][Op:1][KeyLen:2][Key][ValLen:4][Val]...
-
+  void format_and_append_batch_internal(const std::vector<BatchOp> &ops) {
     size_t estimated_size = 4;
     for (const auto &op : ops) {
       estimated_size += 1 + 2 + op.key.size() + 4 + op.value.size();
@@ -140,7 +150,93 @@ public:
       buf.insert(buf.end(), op.value.begin(), op.value.end());
     }
 
-    append(WalOp::BATCH, "", std::string_view((char *)buf.data(), buf.size()));
+    append_internal(WalOp::BATCH, "",
+                    std::string_view((char *)buf.data(), buf.size()));
+  }
+
+  void flusher_loop() {
+    std::vector<std::shared_ptr<PendingCommit>> current_batch;
+    current_batch.reserve(256);
+
+    while (true) {
+      {
+        std::unique_lock lock(queue_mx_);
+        queue_cv_.wait(
+            lock, [this]() { return !commit_queue_.empty() || stop_flusher_; });
+
+        if (stop_flusher_ && commit_queue_.empty())
+          break;
+
+        while (!commit_queue_.empty()) {
+          current_batch.push_back(commit_queue_.front());
+          commit_queue_.pop();
+        }
+      }
+
+      if (current_batch.empty())
+        continue;
+
+      if (wal_) {
+        std::lock_guard lock(mx_);
+        for (auto &req : current_batch) {
+          if (req->is_batch) {
+            format_and_append_batch_internal(req->batch);
+          } else {
+            append_internal(req->op, req->key, req->payload);
+          }
+        }
+        wal_->flush();
+      }
+
+      for (auto &req : current_batch) {
+        req->promise.set_value(true);
+      }
+      current_batch.clear();
+    }
+  }
+
+public:
+  explicit WriteAheadLog(std::string path)
+      : path_(std::move(path)), file_(path_) {}
+
+  ~WriteAheadLog() {
+    {
+      std::lock_guard lock(queue_mx_);
+      stop_flusher_ = true;
+    }
+    queue_cv_.notify_all();
+    if (flusher_thread_.joinable())
+      flusher_thread_.join();
+  }
+
+  void append(WalOp op, std::string_view key, std::string_view payload) {
+    auto req = std::make_shared<PendingCommit>();
+    req->is_batch = false;
+    req->op = op;
+    req->key = key;
+    req->payload = payload;
+    auto fut = req->promise.get_future();
+    {
+      std::lock_guard lock(queue_mx_);
+      commit_queue_.push(req);
+    }
+    queue_cv_.notify_one();
+    fut.wait();
+  }
+
+  void append_batch(const std::vector<BatchOp> &ops) {
+    if (ops.empty())
+      return;
+    auto req = std::make_shared<PendingCommit>();
+    req->is_batch = true;
+    req->batch = ops;
+    auto fut = req->promise.get_future();
+    {
+      std::lock_guard lock(queue_mx_);
+      commit_queue_.push(req);
+    }
+    queue_cv_.notify_one();
+    fut.wait();
   }
 
   using RecoverCallback =
@@ -314,6 +410,8 @@ public:
       std::cerr << "WAL: Seeding failure: " << seek_res.error().message()
                 << "\n";
     }
+
+    flusher_thread_ = std::thread([this]() { flusher_loop(); });
   }
 
   void flush() {

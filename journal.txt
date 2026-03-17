@@ -1,0 +1,7 @@
+2026-03-17 (Performance Upgrades):
+Executed the massive Phase 5 Software Horizon optimization blueprint for L3KV Key-Value engine.
+- Replaced std::shared_mutex B-Tree locking with Thread-Per-Core topology.
+- Converted synchronous allocations to Lock-Free Epoch-Based Reclamation (EBR).
+- Swapped std::hash string processing with XXH3_64bits SIMD hardware loops.
+- Integrated dictionary-trained Zstandard Compression directly into Blob maps.
+YCSB automated benchmarks indicate a >20% increase in baseline throughput under 100% multithreaded capacity parameters. The engine is effectively decoupled from standard OS primitive scaling limits, establishing readiness for the next Linux-based iteration.

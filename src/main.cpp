@@ -37,7 +37,7 @@ struct PeerConfig {
 };
 
 struct Config {
-  std::string address = "0.0.0.0";
+  std::string address = "127.0.0.1";
   unsigned short port = 8080;
   int min_threads = 4;
   int max_threads = 16;

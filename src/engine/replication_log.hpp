@@ -2,11 +2,19 @@
 #define L3KV_ENGINE_REPLICATION_LOG_HPP
 
 #include "clock.hpp" // For Timestamp
+#include <algorithm>
 #include <deque>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
+
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
 
 namespace l3kv {
 

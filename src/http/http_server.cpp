@@ -25,6 +25,10 @@
 #include "engine/store.hpp"
 #include "json.hpp"
 #include "observability/simple_metrics.hpp"
+#include <boost/beast/http/chunk_encode.hpp>
+#include <boost/beast/http/empty_body.hpp>
+#include <boost/beast/http/serializer.hpp>
+#include <boost/beast/http/write.hpp>
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
@@ -133,6 +137,77 @@ private:
       pos = amp + 1;
     }
     return res;
+  }
+
+  void do_prefix_scan(const std::string &prefix, size_t limit) {
+    auto res = std::make_shared<http::response<http::empty_body>>(
+        http::status::ok, req_.version());
+    res->set(http::field::server, "Lite3");
+    res->set(http::field::content_type, "application/json");
+    res->chunked(true);
+    res->keep_alive(req_.keep_alive());
+
+    auto sr =
+        std::make_shared<http::response_serializer<http::empty_body>>(*res);
+    http::async_write_header(socket_, *sr,
+                             [self = shared_from_this(), res, sr, prefix,
+                              limit](beast::error_code ec, std::size_t) {
+                               if (ec) {
+                                 std::cerr
+                                     << "prefix write header: " << ec.message()
+                                     << "\n";
+                                 return self->do_close();
+                               }
+                               self->send_next_chunk(prefix, limit, 0, "", 0);
+                             });
+  }
+
+  void send_next_chunk(std::string prefix, size_t limit, size_t shard_idx,
+                       std::string current_start, size_t total) {
+    if (shard_idx >= 64 || total >= limit) {
+      net::async_write(
+          socket_, http::make_chunk_last(),
+          [self = shared_from_this()](beast::error_code ec, std::size_t) {
+            if (!ec && self->req_.keep_alive())
+              self->do_read();
+            else
+              self->do_close();
+          });
+      return;
+    }
+
+    size_t batch_limit = std::min<size_t>(50, limit - total);
+    auto chunk =
+        db_.get_prefix_chunk(prefix, shard_idx, current_start, batch_limit);
+
+    if (chunk.empty()) {
+      net::post(
+          ioc_, [self = shared_from_this(), prefix, limit, shard_idx, total]() {
+            self->send_next_chunk(prefix, limit, shard_idx + 1, "", total);
+          });
+      return;
+    }
+
+    std::string next_start = chunk.back().first + '\0';
+    size_t total_new = total + chunk.size();
+
+    std::string json_chunk;
+    for (const auto &kv : chunk) {
+      json_chunk += "{\"k\":\"" + kv.first + "\",\"v\":";
+      json_chunk += kv.second + "}\n";
+    }
+
+    auto sp_data = std::make_shared<std::string>(std::move(json_chunk));
+
+    net::async_write(socket_, http::make_chunk(net::buffer(*sp_data)),
+                     [self = shared_from_this(), prefix, limit, shard_idx,
+                      next_start, total_new,
+                      sp_data](beast::error_code ec, std::size_t) {
+                       if (ec)
+                         return self->do_close();
+                       self->send_next_chunk(prefix, limit, shard_idx,
+                                             next_start, total_new);
+                     });
   }
 
   void handle_request() {
@@ -265,7 +340,7 @@ private:
       {
         json p;
         p["id"] = self_node_id_;
-        p["host"] = address_; // Using configured address
+        p["host"] = (address_ == "0.0.0.0") ? "127.0.0.1" : address_;
         p["http_port"] = port_;
         peer_list.push_back(p);
       }
@@ -290,6 +365,18 @@ private:
     }
 
     if (req_.method() == http::verb::get && target.starts_with("/kv/")) {
+      auto qpos = target.find('?');
+      if (qpos != std::string::npos && target.starts_with("/kv/?")) {
+        auto params = parse_query(target.substr(qpos + 1));
+        if (params.count("prefix")) {
+          std::string prefix = params["prefix"];
+          size_t limit = 1000;
+          if (params.count("limit"))
+            limit = std::stoull(params["limit"]);
+          return do_prefix_scan(prefix, limit);
+        }
+      }
+
       std::string key = target.substr(4);
 
       // Sharding Check
@@ -610,7 +697,15 @@ void http_server::adjust_pool_size(int target) {
     // Grow
     int to_add = managed_target - current_managed_threads;
     for (int i = 0; i < to_add; ++i) {
-      thread_pool_.emplace_back([this] {
+      thread_pool_.emplace_back([this, i] {
+#ifdef _WIN32
+        HANDLE hThread = GetCurrentThread();
+        // Shift HTTP threads to the upper half of physical cores,
+        // to avoid overlapping with the lower half 64 Engine Shards.
+        DWORD_PTR mask = (DWORD_PTR)1
+                         << ((i + 32) % std::thread::hardware_concurrency());
+        SetThreadAffinityMask(hThread, mask);
+#endif
         try {
           ioc_.run();
         } catch (const ThreadExit &) {
