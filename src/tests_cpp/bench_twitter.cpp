@@ -1,6 +1,6 @@
 #include <chrono>
 #include <iostream>
-#include <lite3/client.hpp>
+#include <lite3-cpp/client.hpp>
 #include <string>
 #include <vector>
 

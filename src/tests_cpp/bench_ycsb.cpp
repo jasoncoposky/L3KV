@@ -9,7 +9,7 @@
 #include <vector>
 
 #include <document.hpp>
-#include <lite3/smart_client.hpp>
+#include <lite3-cpp/smart_client.hpp>
 
 // --- Configuration ---
 // Workload A: 50% Read, 50% Update

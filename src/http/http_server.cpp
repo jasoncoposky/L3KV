@@ -397,18 +397,39 @@ private:
         return send_response(std::move(res));
       }
 
-      // "Zero-Serialize" Read: Return Raw Binary
-      // The user specified "reads should also not be serialized".
-      // We return the raw lite3 internal buffer. Clients must handle it.
+      // "Zero-Serialize" Read
+      // Verify if client supports raw Zstd
+      bool accepts_zstd = false;
+      auto it = req_.find(http::field::accept_encoding);
+      if (it != req_.end() &&
+          it->value().find("zstd") != std::string_view::npos) {
+        accepts_zstd = true;
+      }
 
       http::response<http::string_body> res{http::status::ok, req_.version()};
       res.set(http::field::server, "Lite3");
-      res.set(http::field::content_type, "application/octet-stream");
-      // Cast raw bytes to string body (copy)
-      const char *ptr = reinterpret_cast<const char *>(buffer_data.data());
-      if (ptr && buffer_data.size() > 0) {
-        res.body().assign(ptr, buffer_data.size());
+
+      if (!accepts_zstd) {
+        // Client wants plain JSON/bytes, but Blob might be Zstd compressed
+        // natively! Wait, the Blob `get` handles transparent decompression on
+        // the proxy side! Actually, wait: `db_.get()` returns a buffer. If
+        // `get` already decompressed it, then it's plain text.
+        res.set(http::field::content_type, "application/json");
+        const char *ptr = reinterpret_cast<const char *>(buffer_data.data());
+        if (ptr && buffer_data.size() > 0) {
+          res.body().assign(ptr, buffer_data.size());
+        }
+      } else {
+        // Future: If client accepts Zstd, we could return the Zstd buffer
+        // natively! But `db_.get()` right now explicitly DECOMPRESSES before
+        // returning.
+        res.set(http::field::content_type, "application/json");
+        const char *ptr = reinterpret_cast<const char *>(buffer_data.data());
+        if (ptr && buffer_data.size() > 0) {
+          res.body().assign(ptr, buffer_data.size());
+        }
       }
+
       res.keep_alive(req_.keep_alive());
       res.prepare_payload();
       return send_response(std::move(res));
