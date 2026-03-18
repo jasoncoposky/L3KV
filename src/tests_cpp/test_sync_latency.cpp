@@ -1,3 +1,4 @@
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -5,6 +6,7 @@
 #define NOMINMAX
 #endif
 #include <winsock2.h>
+#endif
 
 #include "../engine/store.hpp"
 #include "../engine/sync_manager.hpp"

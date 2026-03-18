@@ -101,9 +101,9 @@ target_include_directories(l3svc PRIVATE
 
 target_link_libraries(l3svc PRIVATE
     Threads::Threads
-    ws2_32
-    bcrypt
-    iphlpapi
+    $<$<BOOL:${WIN32}>:ws2_32>
+    $<$<BOOL:${WIN32}>:bcrypt>
+    $<$<BOOL:${WIN32}>:iphlpapi>
     lite3-cpp
     conveyor
     libzstd_static
@@ -152,7 +152,7 @@ target_include_directories(test_phase2 PRIVATE
 )
 target_link_libraries(test_phase2 PRIVATE
     Threads::Threads
-    ws2_32
+    $<$<BOOL:${WIN32}>:ws2_32>
     lite3-cpp
     l3kv_engine
 )
@@ -168,7 +168,7 @@ target_include_directories(test_mesh_stress PRIVATE
 )
 target_link_libraries(test_mesh_stress PRIVATE
     Threads::Threads
-    ws2_32
+    $<$<BOOL:${WIN32}>:ws2_32>
     lite3-cpp
     l3kv_engine
 )
@@ -180,7 +180,7 @@ target_include_directories(test_sync_simulation PRIVATE
 )
 target_link_libraries(test_sync_simulation PRIVATE
     Threads::Threads
-    ws2_32
+    $<$<BOOL:${WIN32}>:ws2_32>
     conveyor
     lite3-cpp
     l3kv_engine
@@ -193,7 +193,7 @@ target_include_directories(test_sync_latency PRIVATE
 )
 target_link_libraries(test_sync_latency PRIVATE
     Threads::Threads
-    ws2_32
+    $<$<BOOL:${WIN32}>:ws2_32>
     conveyor
     lite3-cpp
     l3kv_engine
