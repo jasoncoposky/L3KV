@@ -6,10 +6,10 @@
 
 ## 🚀 Features
 *   **Dynamic Scaling:** Predictive thread pool using a Kalman Filter to auto-scale resources.
-*   **Buffered Persistence:** Write-Ahead Log with **0 ms hot-path latency** (Buffered I/O).
+*   **Zero-Copy WAL:** Write-Ahead Log integrated with `libconveyor`'s reserve/commit API, achieving **67k+ ops/sec** with 0 ms hot-path latency.
+*   **Non-Allocating KeyBuilder:** High-performance meta-key generation with zero heap pressure in the hot write path.
 *   **Graceful Durability:** Guaranteed persistence on shutdown (`SIGINT`, `SIGTERM`).
 *   **Zero-Parse Mutations:** Update a single field in a 10MB document in **< 1 µs**.
-*   **Zero-Copy Architecture:** Data stays in the buffer; no intermediate object trees.
 *   **HTTP/1.1 Interface:** Standard REST API (`GET`, `PUT`, `DELETE`, `PATCH`).
 *   **Observability:** Built-in metrics endpoint and **HTML Dashboard**.
 

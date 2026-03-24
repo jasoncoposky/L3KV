@@ -3,6 +3,7 @@
 #include "merkle.hpp"
 #include "replication_log.hpp"
 #include "wal.hpp"
+#include "KeyBuilder.hpp"
 
 #include <functional>
 #include <iostream>
@@ -11,8 +12,10 @@
 #include <memory_resource>
 #include <optional>
 #include <span>
-#include <string> // Replaced string_view
+#include <future>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "../../lib/concurrentqueue/concurrentqueue.h"
 
@@ -38,7 +41,7 @@ public:
 
   void enter(size_t core_id) {
     local_epochs[core_id].store(global_epoch.load(std::memory_order_acquire),
-                                std::memory_order_release);
+                                 std::memory_order_release);
   }
 
   void exit(size_t core_id) {
@@ -77,13 +80,11 @@ struct DCtxWrapper {
 };
 
 class ZstdManager {
-  std::mutex mu_;
+  std::mutex mx_;
   std::vector<std::string> samples_;
   size_t samples_bytes_ = 0;
-
   ZSTD_CDict *cdict_ = nullptr;
   ZSTD_DDict *ddict_ = nullptr;
-
   std::atomic<bool> active_{false};
 
 public:
@@ -97,15 +98,15 @@ public:
   }
 
   void add_sample(const std::string &data) {
-    if (active_.load(std::memory_order_relaxed))
+    if (active_.load(std::memory_order_acquire)) // Changed to acquire
       return;
 
-    std::lock_guard<std::mutex> lock(mu_);
+    std::lock_guard<std::mutex> lock(mx_); // Used the new mutex
     if (active_.load(std::memory_order_relaxed))
       return;
 
     samples_.push_back(data);
-    samples_bytes_ += data.size();
+    samples_bytes_ += data.size(); // Keep original size_t type
 
     if (samples_.size() >= 1000 || samples_bytes_ >= 100 * 1024) {
       train_dictionary();
@@ -157,7 +158,7 @@ public:
     size_t bound = ZSTD_compressBound(src.size());
     dst.resize(bound);
     size_t csize = ZSTD_compress_usingCDict(cctx.ctx, dst.data(), bound,
-                                            src.data(), src.size(), cdict_);
+                                             src.data(), src.size(), cdict_);
     if (ZSTD_isError(csize)) {
       dst = src;
     } else {
@@ -316,12 +317,23 @@ class Engine {
   std::unique_ptr<ZstdManager> zstd_manager_;
   EBR ebr_;
 
-  Shard &get_shard(const std::string &key) {
-    size_t h = XXH3_64bits(key.data(), key.size());
-    return *shards_[h % SHARDS];
+public:
+  size_t get_routing_shard(const std::string &key) {
+    size_t start = key.find('{');
+    if (start != std::string::npos) {
+      size_t end = key.find('}', start + 1);
+      if (end != std::string::npos) {
+        std::string_view tag(key.data() + start + 1, end - start - 1);
+        return XXH3_64bits(tag.data(), tag.size()) % SHARDS;
+      }
+    }
+    return XXH3_64bits(key.data(), key.size()) % SHARDS;
   }
 
-  // ... (Move methods from bottom to top) ...
+private:
+  Shard &get_shard(const std::string &key) {
+    return *shards_[get_routing_shard(key)];
+  }
 
 private:
   Timestamp get_local_timestamp_internal(const std::string &key) {
@@ -436,9 +448,11 @@ public:
 #endif
         auto &s = get_shard_by_index(i);
         CoreMessage msg;
+        int spin = 0;
         while (!s.stop_flag.load(std::memory_order_relaxed) ||
                s.messages.size_approx() > 0) {
           if (s.messages.try_dequeue(msg)) {
+            spin = 0;
             ebr_.enter(i);
             msg.task();
             s.ops_since_reclaim++;
@@ -451,7 +465,11 @@ public:
             }
             ebr_.exit(i);
           } else {
-            std::this_thread::yield();
+            if (spin < 10000) {
+              spin++;
+            } else {
+              std::this_thread::yield();
+            }
           }
         }
       });
@@ -469,14 +487,11 @@ public:
 
   Shard &get_shard_by_index(size_t index) { return *shards_[index]; }
 
-  template <typename Func>
-  auto submit_to_shard(const std::string &key, Func &&f) {
-    using ReturnType = decltype(f());
-    size_t h = XXH3_64bits(key.data(), key.size()) % SHARDS;
+  template <typename Func> std::future<typename std::invoke_result_t<Func>> submit_to_shard_idx(size_t h, Func &&f) {
+    using ReturnType = typename std::invoke_result_t<Func>;
     auto &s = *shards_[h];
 
-    std::shared_ptr<std::promise<ReturnType>> p =
-        std::make_shared<std::promise<ReturnType>>();
+    std::shared_ptr<std::promise<ReturnType>> p = std::make_shared<std::promise<ReturnType>>();
     auto fut = p->get_future();
 
     s.messages.enqueue({[p, f = std::forward<Func>(f)]() mutable {
@@ -487,7 +502,18 @@ public:
         p->set_value(f());
       }
     }});
-    return fut.get();
+    return fut;
+  }
+
+  template <typename Func> void submit_async(const std::string &key, Func &&f) {
+    size_t h = get_routing_shard(key);
+    auto &s = *shards_[h];
+    s.messages.enqueue({[f = std::forward<Func>(f)]() mutable { f(); }});
+  }
+
+  template <typename Func> auto submit_to_shard(const std::string &key, Func &&f) {
+    size_t h = get_routing_shard(key);
+    return submit_to_shard_idx(h, std::forward<Func>(f)).get();
   }
 
   lite3cpp::Buffer get(const std::string &key) {
@@ -510,24 +536,28 @@ public:
 
   void put(std::string key, const std::string &json_body) {
     auto now = clock_.now();
-    std::string meta_key = key + ":meta";
+    std::string_view mkey_v = KeyBuilder::meta_key(key);
+    std::string mkey_s(mkey_v);
     std::string meta_val = "{\"ts\":" + std::to_string(now.wall_time) +
                            ",\"l\":" + std::to_string(now.logical) +
                            ",\"n\":" + std::to_string(now.node_id) + "}";
 
     std::vector<BatchOp> batch;
     batch.push_back({WalOp::PUT, key, json_body});
-    batch.push_back({WalOp::PUT, meta_key, meta_val});
+    batch.push_back({WalOp::PUT, mkey_s, meta_val});
 
     wal_->append_batch(batch);
 
-    apply_put(key, json_body);
-    apply_put(meta_key, meta_val);
+    submit_async(key, [this, key, json_body, mkey_s, meta_val]() {
+      apply_put(key, json_body);
+      apply_put(mkey_s, meta_val);
+    });
   }
 
   void patch_int(std::string key, std::string field, int64_t val) {
     auto now = clock_.now();
-    std::string meta_key = key + ":meta";
+    std::string_view mkey_v = KeyBuilder::meta_key(key);
+    std::string mkey_s(mkey_v);
     std::string ts_str = std::to_string(now.wall_time) + ":" +
                          std::to_string(now.logical) + ":" +
                          std::to_string(now.node_id);
@@ -537,17 +567,20 @@ public:
 
     std::vector<BatchOp> batch;
     batch.push_back({WalOp::PATCH_I64, key, log_payload_int});
-    batch.push_back({WalOp::PATCH_STR, meta_key, log_payload_str});
+    batch.push_back({WalOp::PATCH_STR, mkey_s, log_payload_str});
 
     wal_->append_batch(batch);
 
-    apply_patch_int(key, field, val);
-    apply_patch_str(meta_key, field, ts_str);
+    submit_async(key, [this, key, field, val, mkey_s, ts_str]() {
+      apply_patch_int(key, field, val);
+      apply_patch_str(mkey_s, field, ts_str);
+    });
   }
 
   void patch_str(std::string key, std::string field, std::string val) {
     auto now = clock_.now();
-    std::string meta_key = key + ":meta";
+    std::string_view mkey_v = KeyBuilder::meta_key(key);
+    std::string mkey_s(mkey_v);
     std::string ts_str = std::to_string(now.wall_time) + ":" +
                          std::to_string(now.logical) + ":" +
                          std::to_string(now.node_id);
@@ -557,17 +590,20 @@ public:
 
     std::vector<BatchOp> batch;
     batch.push_back({WalOp::PATCH_STR, key, log_payload_str});
-    batch.push_back({WalOp::PATCH_STR, meta_key, log_payload_meta});
+    batch.push_back({WalOp::PATCH_STR, mkey_s, log_payload_meta});
 
     wal_->append_batch(batch);
 
-    apply_patch_str(key, field, val);
-    apply_patch_str(meta_key, field, ts_str);
+    submit_async(key, [this, key, field, val, mkey_s, ts_str]() {
+      apply_patch_str(key, field, val);
+      apply_patch_str(mkey_s, field, ts_str);
+    });
   }
 
   bool del(const std::string &key) {
     auto now = clock_.now();
-    std::string meta_key = key + ":meta";
+    std::string_view mkey_v = KeyBuilder::meta_key(key);
+    std::string mkey_s(mkey_v);
     std::string meta_val = "{\"ts\":" + std::to_string(now.wall_time) +
                            ",\"l\":" + std::to_string(now.logical) +
                            ",\"n\":" + std::to_string(now.node_id) +
@@ -575,21 +611,20 @@ public:
 
     std::vector<BatchOp> batch;
     batch.push_back({WalOp::DELETE_, key, ""});
-    batch.push_back({WalOp::PUT, meta_key, meta_val});
+    batch.push_back({WalOp::PUT, mkey_s, meta_val});
 
     wal_->append_batch(batch);
 
-    bool existed = apply_del(key);
-    apply_put(meta_key, meta_val);
-    return existed;
+    return submit_to_shard(key, [this, key, mkey_s, meta_val]() {
+      bool existed = apply_del(key);
+      apply_put(mkey_s, meta_val);
+      return existed;
+    });
   }
 
-  // ... apply_mutation remains mostly same but uses modified apply_del ...
-
   inline void apply_mutation(const Mutation &m) {
-    // ... (TS checks same as before) ...
-    // 1. Get Local TS (Inlined)
-    std::string meta_key_lookup = m.key + ":meta";
+    std::string_view meta_key_v = KeyBuilder::meta_key(m.key);
+    std::string meta_key_lookup(meta_key_v);
     auto buf = get(meta_key_lookup);
     Timestamp local_ts{0, 0, 0};
     if (buf.size() > 0) {
@@ -608,9 +643,7 @@ public:
                 << " Local: " << local_ts.wall_time << "\n";
       return;
     }
-    // std::cerr << "[Store] Applying mutation for " << m.key << "\n";
 
-    std::string meta_key = m.key + ":meta";
     std::string meta_val = "{\"ts\":" + std::to_string(m.timestamp.wall_time) +
                            ",\"l\":" + std::to_string(m.timestamp.logical) +
                            ",\"n\":" + std::to_string(m.timestamp.node_id) +
@@ -623,7 +656,7 @@ public:
       std::string val_str(m.value.begin(), m.value.end());
       wal_batch.push_back({WalOp::PUT, m.key, val_str});
     }
-    wal_batch.push_back({WalOp::PUT, meta_key, meta_val});
+    wal_batch.push_back({WalOp::PUT, meta_key_lookup, meta_val});
 
     wal_->append_batch(wal_batch);
 
@@ -633,10 +666,19 @@ public:
       std::string val_str(m.value.begin(), m.value.end());
       apply_put(m.key, val_str);
     }
-    apply_put(meta_key, meta_val);
+    apply_put(meta_key_lookup, meta_val);
   }
 
   void flush() { wal_->flush(); }
+  void wait_all_shards() {
+    std::vector<std::future<void>> futures;
+    for (size_t i = 0; i < SHARDS; ++i) {
+      futures.push_back(submit_to_shard_idx(i, []() {}));
+    }
+    for (auto &f : futures) {
+      f.get();
+    }
+  }
   auto get_wal_stats() { return wal_->stats(); }
   uint64_t get_merkle_root_hash() { return merkle_.get_root_hash(); }
   uint64_t get_merkle_node(int level, int index) {
@@ -645,10 +687,9 @@ public:
 
   std::vector<std::pair<std::string, uint64_t>>
   get_bucket_keys(int bucket_idx) {
-    // This is a naive scatter-gather that sweeps all 64 shards.
     std::vector<std::pair<std::string, uint64_t>> result;
     for (size_t i = 0; i < SHARDS; ++i) {
-      auto part = submit_to_shard(std::to_string(i), [&, i]() {
+      auto fut = submit_to_shard_idx(i, [&, i, bucket_idx]() {
         std::vector<std::pair<std::string, uint64_t>> local_res;
         auto &shard = *shards_[i];
         for (auto &[k, v] : shard.map) {
@@ -660,6 +701,7 @@ public:
         }
         return local_res;
       });
+      auto part = fut.get();
       result.insert(result.end(), part.begin(), part.end());
     }
     return result;
@@ -673,7 +715,7 @@ public:
       return chunk;
 
     auto &s = *shards_[shard_idx];
-    return submit_to_shard(std::to_string(shard_idx), [&, shard_idx]() {
+    return submit_to_shard_idx(shard_idx, [&, shard_idx]() {
       auto it = s.map.lower_bound(start_key);
       while (it != s.map.end() && it->first.starts_with(prefix)) {
         if (it->first > start_key ||
@@ -698,7 +740,60 @@ public:
         ++it;
       }
       return chunk;
-    });
+    }).get();
+  }
+
+  std::vector<std::string> get_prefix_keys(const std::string &prefix,
+                                           size_t shard_idx,
+                                           const std::string &start_key,
+                                           size_t limit) {
+    std::vector<std::string> chunk;
+    if (shard_idx >= SHARDS)
+      return chunk;
+
+    auto &s = *shards_[shard_idx];
+    return submit_to_shard_idx(shard_idx, [&, shard_idx]() {
+      auto it = s.map.lower_bound(start_key);
+      while (it != s.map.end() && it->first.starts_with(prefix)) {
+        if (it->first > start_key ||
+            (chunk.empty() && it->first >= start_key)) {
+          chunk.push_back(it->first);
+          if (chunk.size() >= limit)
+            break;
+        }
+        ++it;
+      }
+      return chunk;
+    }).get();
+  }
+  std::vector<std::string>
+  get_prefix_keys_all_shards(const std::string &prefix,
+                             const std::string &start_key,
+                             size_t limit_per_shard) {
+    std::vector<std::future<std::vector<std::string>>> futures;
+    for (size_t i = 0; i < SHARDS; ++i) {
+      futures.push_back(submit_to_shard_idx(i, [this, i, prefix, start_key, limit_per_shard]() {
+        std::vector<std::string> chunk;
+        auto &s = *shards_[i];
+        auto it = s.map.lower_bound(start_key);
+        while (it != s.map.end() && it->first.starts_with(prefix)) {
+          if (it->first >= start_key) {
+            chunk.push_back(it->first);
+            if (chunk.size() >= limit_per_shard)
+              break;
+          }
+          ++it;
+        }
+        return chunk;
+      }));
+    }
+
+    std::vector<std::string> results;
+    for (auto &fut : futures) {
+      auto chunk = fut.get();
+      results.insert(results.end(), chunk.begin(), chunk.end());
+    }
+    return results;
   }
 };
 
