@@ -10,8 +10,10 @@
 #include "engine/mesh.hpp"
 #include "engine/store.hpp"
 #include "engine/sync_manager.hpp"
-#include "http/http_server.hpp"
+#include "zmq/zmq_server.hpp"
 #include "observability/simple_metrics.hpp"
+
+#include "observability/file_logger.hpp"
 #include <iostream>
 #include <lite3/ring.hpp>
 
@@ -40,7 +42,7 @@ struct Config {
   std::string address = "127.0.0.1";
   unsigned short port = 8080;
   int min_threads = 4;
-  int max_threads = 16;
+  int max_threads = 32;
   std::string wal_path = "data.wal";
   uint32_t node_id = 1;
   int mesh_port = 9090;
@@ -119,20 +121,22 @@ Config load_config(const std::string &path) {
 int main(int argc, char *argv[]) {
   try {
     std::string config_path = "config.json";
-    if (argc > 1) {
-      config_path = argv[1];
+    for (int i = 1; i < argc; ++i) {
+      std::string arg = argv[i];
+      if (arg == "--config" && i + 1 < argc) {
+        config_path = argv[++i];
+      } else if (arg[0] != '-') {
+        config_path = arg;
+      }
     }
 
     Config cfg = load_config(config_path);
 
-    std::cout << "Starting Lite3 Service..." << std::endl;
-    std::cout << "  Address: " << cfg.address << ":" << cfg.port << std::endl;
-    std::cout << "  Threads: " << cfg.min_threads << "-" << cfg.max_threads
-              << "(Dynamic)" << std::endl;
-    std::cout << "  WAL Path: " << cfg.wal_path << std::endl;
-    std::cout << "  Node ID: " << cfg.node_id << std::endl;
-    std::cout << "  Mesh Port: " << cfg.mesh_port << std::endl;
-    std::cout << "  Mesh Threads: " << cfg.mesh_threads << std::endl;
+    l3kv::FileLogger::instance().open("l3svc_" + std::to_string(cfg.node_id) + ".log");
+    L3_INFO("Starting Lite3 Service...");
+    L3_INFO("  Address: " + cfg.address + ":" + std::to_string(cfg.port));
+    L3_INFO("  Threads: " + std::to_string(cfg.min_threads) + "-" + std::to_string(cfg.max_threads));
+    L3_INFO("  Node ID: " + std::to_string(cfg.node_id));
 
     // Register metrics with lite3-cpp
     lite3cpp::set_metrics(&global_metrics);
@@ -146,9 +150,10 @@ int main(int argc, char *argv[]) {
     l3kv::SyncManager sync(mesh, db, cfg.node_id);
 
     mesh.set_on_message([&](l3kv::NodeID from, l3kv::Lane lane,
-                            const std::vector<uint8_t> &payload) {
+                            const lite3cpp::Buffer &payload) {
       if (lane == l3kv::Lane::Control) {
-        sync.handle_message(from, payload);
+        std::vector<uint8_t> vec_payload(payload.data(), payload.data() + payload.size());
+        sync.handle_message(from, vec_payload);
       }
     });
 
@@ -210,15 +215,20 @@ int main(int argc, char *argv[]) {
       std::cout << "Cluster Mode: REPLICATED (Geo/Local)." << std::endl;
     }
 
-    // Start HTTP Server
-    std::cout << "DEBUG: Starting HTTP Server..." << std::endl;
-    http_server::http_server server(db, cfg.address, cfg.port, cfg.min_threads,
-                                    cfg.max_threads, ring, cfg.node_id,
-                                    http_peers);
-    std::cout << "Lite3 Service listening on :" << cfg.port << std::endl;
-    server.run();
+    // Start ZeroMQ Server
+    std::cout << "DEBUG: Starting ZeroMQ Server..." << std::endl;
+    l3kv::ZmqServer zmq_srv(&db, cfg.address, cfg.port);
+    
+    std::thread mesh_thread([&io_context]() {
+      io_context.run();
+    });
 
-    // Cleanup
+    L3_INFO("Lite3 Service listening on ZMQ :" + std::to_string(cfg.port));
+    zmq_srv.run();
+
+
+    if (mesh_thread.joinable()) mesh_thread.join();
+    L3_INFO("Server stopping gracefully...");
     sync.stop();
     io_context.stop();
 
@@ -227,10 +237,10 @@ int main(int argc, char *argv[]) {
         t.join();
     }
 
-    std::cout << "\nServer stopping gracefully..." << std::endl;
     db.flush();
     global_metrics.dump_metrics();
   } catch (const std::exception &e) {
+    L3_ERROR("Fatal Error in main: " + std::string(e.what()));
     std::cerr << "Error: " << e.what() << std::endl;
     return 1;
   }

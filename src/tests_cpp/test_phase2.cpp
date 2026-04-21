@@ -65,7 +65,8 @@ void test_mesh_loopback() {
 
   // Send message
   std::string msg = "Hello Lane 0";
-  client.send(100, Lane::Express, std::vector<uint8_t>(msg.begin(), msg.end()));
+  client.send(100, Lane::Express, lite3cpp::Buffer(std::vector<uint8_t>(msg.begin(), msg.end())));
+
 
   // Wait for receipt
   for (int i = 0; i < 10; ++i) {

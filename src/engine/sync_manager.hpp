@@ -121,7 +121,8 @@ private:
     pay.resize(1 + 4 + 8);
     std::memcpy(&pay[1], &node_id_, 4);
     std::memcpy(&pay[5], &root, 8);
-    mesh_.send(target, Lane::Control, pay);
+    lite3cpp::Buffer buf_pay(std::move(pay));
+    mesh_.send(target, Lane::Control, std::move(buf_pay));
 
 #ifndef LITE3CPP_DISABLE_OBSERVABILITY
     if (auto *m = lite3cpp::g_metrics.load(std::memory_order_relaxed)) {
@@ -183,7 +184,8 @@ private:
     pay[5] = level;
     std::memcpy(&pay[6], &parent, 4);
 
-    mesh_.send(to, Lane::Control, pay);
+    lite3cpp::Buffer buf_pay(std::move(pay));
+    mesh_.send(to, Lane::Control, std::move(buf_pay));
   }
 
   void on_req_node(NodeID from, const std::vector<uint8_t> &buf) {
@@ -217,7 +219,8 @@ private:
       rep.resize(old_sz + 8);
       std::memcpy(&rep[old_sz], &h, 8);
     }
-    mesh_.send(from, Lane::Control, rep);
+    lite3cpp::Buffer buf_rep(std::move(rep));
+    mesh_.send(from, Lane::Control, std::move(buf_rep));
   }
 
   void on_rep_node(NodeID from, const std::vector<uint8_t> &buf) {
@@ -267,7 +270,8 @@ private:
     pay.resize(1 + 4 + 4);
     std::memcpy(&pay[1], &node_id_, 4);
     std::memcpy(&pay[5], &bucket_idx, 4);
-    mesh_.send(to, Lane::Control, pay);
+    lite3cpp::Buffer buf_pay(std::move(pay));
+    mesh_.send(to, Lane::Control, std::move(buf_pay));
   }
 
   void on_req_bucket(NodeID from, const std::vector<uint8_t> &buf) {
@@ -306,7 +310,8 @@ private:
       std::memcpy(&pay[p + 2], pair.first.data(), klen);
       std::memcpy(&pay[p + 2 + klen], &pair.second, 8);
     }
-    mesh_.send(from, Lane::Heavy, pay); // Use Heavy for data listing
+    lite3cpp::Buffer buf_pay(std::move(pay));
+    mesh_.send(from, Lane::Heavy, std::move(buf_pay)); // Use Heavy for data listing
   }
 
   void on_rep_bucket(NodeID from, const std::vector<uint8_t> &buf) {
@@ -367,7 +372,8 @@ private:
     pay.resize(5);
     std::memcpy(&pay[1], &node_id_, 4);
     pay.insert(pay.end(), key.begin(), key.end());
-    mesh_.send(to, Lane::Heavy, pay);
+    lite3cpp::Buffer buf_pay(std::move(pay));
+    mesh_.send(to, Lane::Heavy, std::move(buf_pay));
   }
 
   void on_get_val(NodeID from, const std::vector<uint8_t> &buf) {
@@ -411,7 +417,8 @@ private:
 
     std::cerr << "[Sync] Sending PutVal for " << key << " Size: " << pay.size()
               << "\n";
-    mesh_.send(from, Lane::Heavy, pay);
+    lite3cpp::Buffer buf_pay(std::move(pay));
+    mesh_.send(from, Lane::Heavy, std::move(buf_pay));
   }
 
   void on_put_val(NodeID from, const std::vector<uint8_t> &buf) {

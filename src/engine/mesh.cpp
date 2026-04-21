@@ -52,7 +52,7 @@ public:
     });
   }
 
-  void send(std::vector<uint8_t> payload) {
+  void send(lite3cpp::Buffer payload) {
     boost::asio::post(
         strand_, [self = shared_from_this(), p = std::move(payload)]() mutable {
           bool write_in_progress = !self->outbox_.empty();
@@ -74,7 +74,7 @@ private:
   std::vector<uint8_t> read_buffer_; // For body
   uint32_t header_buffer_[2];        // [0]=Lane, [1]=Size
   uint32_t handshake_id_ = 0;
-  std::deque<std::vector<uint8_t>> outbox_;
+  std::deque<lite3cpp::Buffer> outbox_;
 
   void do_send_id(NodeID my_id) {
     auto self(shared_from_this());
@@ -123,16 +123,18 @@ private:
 
   void do_read_body(uint32_t lane, uint32_t size) {
     auto self(shared_from_this());
-    read_buffer_.resize(size);
+    lite3cpp::Buffer read_buf;
+    read_buf.init_object(); // Allocate or ensure capacity if needed, but we'll use a vector for reading
+    auto read_vec = std::make_shared<std::vector<uint8_t>>(size);
     boost::asio::async_read(
-        socket_, boost::asio::buffer(read_buffer_),
-        boost::asio::bind_executor(strand_, [this, self, lane,
-                                             size](boost::system::error_code ec,
-                                                   std::size_t /*length*/) {
+        socket_, boost::asio::buffer(*read_vec),
+        boost::asio::bind_executor(strand_, [this, self, lane, size,
+                                             read_vec](boost::system::error_code ec,
+                                                       std::size_t /*length*/) {
           if (!ec) {
-            // Dispatch to Mesh callback (TODO: Identify Peer ID?)
+            lite3cpp::Buffer final_buf(std::move(*read_vec));
             if (mesh_->on_message_) {
-              mesh_->on_message_(0, static_cast<Lane>(lane), read_buffer_);
+              mesh_->on_message_(self->peer_id_, static_cast<Lane>(lane), final_buf);
 #ifndef LITE3CPP_DISABLE_OBSERVABILITY
               if (auto *m =
                       lite3cpp::g_metrics.load(std::memory_order_relaxed)) {
@@ -142,16 +144,15 @@ private:
 #endif
             }
             do_read_header(); // Loop
-          } else {
-            // Error
           }
         }));
   }
 
   void do_write() {
     auto self(shared_from_this());
+    auto& front = outbox_.front();
     boost::asio::async_write(
-        socket_, boost::asio::buffer(outbox_.front()),
+        socket_, boost::asio::buffer(front.data(), front.size()),
         boost::asio::bind_executor(
             strand_,
             [this, self](boost::system::error_code ec, std::size_t /*length*/) {
@@ -160,8 +161,6 @@ private:
                 if (!outbox_.empty()) {
                   do_write();
                 }
-              } else {
-                // Error
               }
             }));
   }
@@ -223,7 +222,7 @@ void Mesh::connect(NodeID peer_id, const std::string &host, int port) {
   peers_[peer_id] = peer;
 }
 
-bool Mesh::send(NodeID peer_id, Lane lane, std::vector<uint8_t> payload) {
+bool Mesh::send(NodeID peer_id, Lane lane, lite3cpp::Buffer payload) {
   std::shared_ptr<Peer> peer;
   {
     std::lock_guard<std::mutex> lock(peers_mx_);
@@ -241,9 +240,10 @@ bool Mesh::send(NodeID peer_id, Lane lane, std::vector<uint8_t> payload) {
   header[0] = static_cast<uint32_t>(lane);
   header[1] = static_cast<uint32_t>(payload.size());
 
-  std::vector<uint8_t> frame(sizeof(header) + payload.size());
-  std::memcpy(frame.data(), header, sizeof(header));
-  std::memcpy(frame.data() + sizeof(header), payload.data(), payload.size());
+  lite3cpp::Buffer frame;
+  frame.init_object();
+  frame.set_bytes(0, "h", std::span(reinterpret_cast<const std::byte*>(header), sizeof(header)));
+  frame.set_bytes(0, "b", std::span(reinterpret_cast<const std::byte*>(payload.data()), payload.size()));
 
   int lat = latency_ms_.load();
   if (lat > 0) {
@@ -252,7 +252,7 @@ bool Mesh::send(NodeID peer_id, Lane lane, std::vector<uint8_t> payload) {
     timer->async_wait([timer, peer, f = std::move(frame)](
                           const boost::system::error_code &ec) mutable {
       if (!ec) {
-        if (peer->conn) // Re-check connection?
+        if (peer->conn)
           peer->conn->send(std::move(f));
       }
     });

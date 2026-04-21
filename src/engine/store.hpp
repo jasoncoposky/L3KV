@@ -14,7 +14,7 @@
 #include <span>
 #include <future>
 #include <string>
-#include <thread>
+#include <shared_mutex>
 #include <vector>
 
 #include "../../lib/concurrentqueue/concurrentqueue.h"
@@ -29,44 +29,8 @@
 
 namespace l3kv {
 
-class EBR {
-public:
-  std::atomic<uint64_t> global_epoch{1};
-  std::array<std::atomic<uint64_t>, 64> local_epochs; // Max 64 shards
-
-  EBR() {
-    for (auto &e : local_epochs)
-      e = 0;
-  }
-
-  void enter(size_t core_id) {
-    local_epochs[core_id].store(global_epoch.load(std::memory_order_acquire),
-                                 std::memory_order_release);
-  }
-
-  void exit(size_t core_id) {
-    local_epochs[core_id].store(0, std::memory_order_release);
-  }
-
-  uint64_t get_min_epoch() {
-    uint64_t min_e = global_epoch.load();
-    for (const auto &e : local_epochs) {
-      uint64_t le = e.load(std::memory_order_acquire);
-      if (le > 0 && le < min_e)
-        min_e = le;
-    }
-    return min_e;
-  }
-
-  void advance() { global_epoch.fetch_add(1, std::memory_order_acq_rel); }
-};
-
 class Blob;
 
-struct EbrGarbageList {
-  uint64_t retire_epoch;
-  std::vector<std::unique_ptr<Blob>> items;
-};
 
 struct CCtxWrapper {
   ZSTD_CCtx *ctx;
@@ -274,40 +238,30 @@ public:
   std::span<const uint8_t> view() const { return {buf_.data(), buf_.size()}; }
 };
 
+class ILogger {
+public:
+  virtual ~ILogger() = default;
+  virtual void log(const std::string& msg) = 0;
+};
+
 class Engine {
-  static constexpr size_t SHARDS = 64;
+  static constexpr size_t SHARDS = 8;
+  std::shared_ptr<ILogger> logger_;
   struct CoreMessage {
     std::function<void()> task;
   };
 
   struct alignas(64) Shard {
     std::pmr::unsynchronized_pool_resource pool;
-    std::map<std::string, std::unique_ptr<Blob>> map;
-
-    // EBR
-    std::vector<EbrGarbageList> garbage;
-    uint32_t ops_since_reclaim = 0;
-
-    void retire(std::unique_ptr<Blob> blob, uint64_t global_ep) {
-      if (garbage.empty() || garbage.back().retire_epoch != global_ep) {
-        garbage.push_back({global_ep, {}});
-      }
-      garbage.back().items.push_back(std::move(blob));
-    }
-
-    void reclaim(uint64_t min_epoch) {
-      auto it = garbage.begin();
-      while (it != garbage.end() && it->retire_epoch < min_epoch) {
-        it = garbage.erase(it);
-      }
-    }
-
+    std::map<std::string, std::shared_ptr<const Blob>> map;
+    
     // Message passing
     moodycamel::ConcurrentQueue<CoreMessage> messages;
     std::atomic<bool> stop_flag{false};
     std::thread core_thread;
 
     Shard() : pool(std::pmr::new_delete_resource()) {}
+    mutable std::shared_mutex read_mu;
   };
 
   std::vector<std::unique_ptr<Shard>> shards_;
@@ -315,7 +269,7 @@ class Engine {
   HybridLogicalClock clock_;
   MerkleTree merkle_;
   std::unique_ptr<ZstdManager> zstd_manager_;
-  EBR ebr_;
+
 
 public:
   size_t get_routing_shard(const std::string &key) {
@@ -340,7 +294,7 @@ private:
     return {0, 0, 0};
   }
 
-  uint64_t hash_blob(const std::unique_ptr<Blob> &blob) {
+  uint64_t hash_blob(const std::shared_ptr<const Blob> &blob) {
     if (!blob)
       return 0;
     auto v = blob->view();
@@ -349,57 +303,85 @@ private:
 
   void apply_put(const std::string &key, const std::string &json_body) {
     auto &s = get_shard(key);
+    std::unique_lock lock(s.read_mu);
 
     uint64_t old_h = 0;
-    if (s.map.contains(key)) {
-      old_h = hash_blob(s.map[key]);
-    } else {
-      s.map[key] = std::make_unique<Blob>(&s.pool);
+    auto it = s.map.find(key);
+    if (it != s.map.end()) {
+      old_h = hash_blob(it->second);
     }
 
-    s.map[key]->overwrite(json_body, zstd_manager_.get());
-    uint64_t new_h = hash_blob(s.map[key]);
+    auto new_blob = std::make_shared<Blob>(&s.pool);
+    new_blob->overwrite(json_body, zstd_manager_.get());
+    uint64_t new_h = hash_blob(new_blob);
+    
+    s.map[key] = std::move(new_blob);
     merkle_.apply_delta(key, old_h ^ new_h);
   }
 
   void apply_patch_int(const std::string &key, const std::string &field,
                        int64_t val) {
     auto &s = get_shard(key);
-    if (!s.map.contains(key))
-      s.map[key] = std::make_unique<Blob>(&s.pool);
+    std::unique_lock lock(s.read_mu);
+    
+    uint64_t old_h = 0;
+    std::shared_ptr<Blob> new_blob;
+    
+    auto it = s.map.find(key);
+    if (it != s.map.end()) {
+      old_h = hash_blob(it->second);
+      new_blob = std::make_shared<Blob>(*it->second); // Copy constructor needed
+    } else {
+      new_blob = std::make_shared<Blob>(&s.pool);
+    }
 
-    uint64_t old_h = hash_blob(s.map[key]);
-    s.map[key]->set_int(field, val, zstd_manager_.get());
-    uint64_t new_h = hash_blob(s.map[key]);
+    new_blob->set_int(field, val, zstd_manager_.get());
+    uint64_t new_h = hash_blob(new_blob);
+    
+    s.map[key] = std::move(new_blob);
     merkle_.apply_delta(key, old_h ^ new_h);
   }
 
   void apply_patch_str(const std::string &key, const std::string &field,
                        const std::string &val) {
     auto &s = get_shard(key);
-    if (!s.map.contains(key))
-      s.map[key] = std::make_unique<Blob>(&s.pool);
+    std::unique_lock lock(s.read_mu);
+    
+    uint64_t old_h = 0;
+    std::shared_ptr<Blob> new_blob;
+    
+    auto it = s.map.find(key);
+    if (it != s.map.end()) {
+      old_h = hash_blob(it->second);
+      new_blob = std::make_shared<Blob>(*it->second);
+    } else {
+      new_blob = std::make_shared<Blob>(&s.pool);
+    }
 
-    uint64_t old_h = hash_blob(s.map[key]);
-    s.map[key]->set_str(field, val, zstd_manager_.get());
-    uint64_t new_h = hash_blob(s.map[key]);
+    new_blob->set_str(field, val, zstd_manager_.get());
+    uint64_t new_h = hash_blob(new_blob);
+    
+    s.map[key] = std::move(new_blob);
     merkle_.apply_delta(key, old_h ^ new_h);
   }
 
   bool apply_del(const std::string &key) {
     auto &s = get_shard(key);
+    std::unique_lock lock(s.read_mu);
 
-    // Tombstone logic: Don't erase. Set to empty.
-    if (!s.map.contains(key)) {
-      s.map[key] = std::make_unique<Blob>(&s.pool);
+    uint64_t old_h = 0;
+    auto it = s.map.find(key);
+    if (it != s.map.end()) {
+        old_h = hash_blob(it->second);
     }
 
-    uint64_t old_h = hash_blob(s.map[key]);
-    s.map[key]->overwrite("", zstd_manager_.get()); // Set to empty (Tombstone)
-    uint64_t new_h = hash_blob(s.map[key]);
+    auto new_blob = std::make_shared<Blob>(&s.pool);
+    new_blob->overwrite("", zstd_manager_.get()); // Set to empty (Tombstone)
+    uint64_t new_h = hash_blob(new_blob);
 
+    s.map[key] = std::move(new_blob);
     merkle_.apply_delta(key, old_h ^ new_h);
-    return true; // Always "succeeded" in setting tombstone
+    return true;
   }
 
 public:
@@ -453,26 +435,18 @@ public:
                s.messages.size_approx() > 0) {
           if (s.messages.try_dequeue(msg)) {
             spin = 0;
-            ebr_.enter(i);
             msg.task();
-            s.ops_since_reclaim++;
-
-            if (s.ops_since_reclaim >= 1000) {
-              if (i == 0)
-                ebr_.advance();
-              s.reclaim(ebr_.get_min_epoch());
-              s.ops_since_reclaim = 0;
-            }
-            ebr_.exit(i);
           } else {
-            if (spin < 10000) {
+            if (spin < 1000) {
               spin++;
             } else {
-              std::this_thread::yield();
+              std::this_thread::sleep_for(std::chrono::microseconds(50));
+              spin = 0;
             }
           }
         }
       });
+
     }
   }
 
@@ -516,22 +490,31 @@ public:
     return submit_to_shard_idx(h, std::forward<Func>(f)).get();
   }
 
-  lite3cpp::Buffer get(const std::string &key) {
-    return submit_to_shard(key, [&, key]() {
-      auto &s = get_shard(key);
-      if (auto it = s.map.find(key); it != s.map.end()) {
-        if (it->second->compressed_) {
-          std::string src(
-              reinterpret_cast<const char *>(it->second->buf_.data()),
-              it->second->buf_.size());
-          std::string dst;
-          zstd_manager_->decompress(src, dst, it->second->original_size_);
-          return lite3cpp::Buffer(std::vector<uint8_t>(dst.begin(), dst.end()));
+  std::shared_ptr<const Blob> get_view(const std::string &key) {
+    size_t h = get_routing_shard(key);
+    auto &s = *shards_[h];
+    std::shared_ptr<const Blob> result;
+    {
+        std::shared_lock lock(s.read_mu);
+        if (auto it = s.map.find(key); it != s.map.end()) {
+            result = it->second;
         }
-        return it->second->buf_;
-      }
-      return lite3cpp::Buffer();
-    });
+    }
+    
+    return result;
+  }
+
+  lite3cpp::Buffer get(const std::string &key) {
+    auto view = get_view(key);
+    if (!view) return {};
+
+    if (view->compressed_) {
+        std::string src(reinterpret_cast<const char *>(view->buf_.data()), view->buf_.size());
+        std::string dst;
+        zstd_manager_->decompress(src, dst, view->original_size_);
+        return lite3cpp::Buffer(std::vector<uint8_t>(dst.begin(), dst.end()));
+    }
+    return view->buf_;
   }
 
   void put(std::string key, const std::string &json_body) {
@@ -622,6 +605,75 @@ public:
     });
   }
 
+  void batch_put(const lite3cpp::Buffer &batch) {
+    std::vector<BatchOp> wal_batch;
+    struct ShardWork {
+      std::vector<std::pair<std::string, std::string>> updates;
+    };
+    std::map<size_t, ShardWork> shard_works;
+
+    size_t root = 0;
+    for (auto it = batch.begin(root); it != batch.end(root); ++it) {
+      std::string key(it->key);
+      auto type = batch.get_type(root, key);
+      std::string val;
+      if (type == lite3cpp::Type::String) {
+        val = batch.get_str(root, key);
+      } else if (type == lite3cpp::Type::Bytes) {
+        auto b = batch.get_bytes(root, key);
+        val = std::string(reinterpret_cast<const char *>(b.data()), b.size());
+      } else {
+        continue;
+      }
+
+      auto now = clock_.now();
+      std::string mkey_s(KeyBuilder::meta_key(key));
+      std::string meta_val = "{\"ts\":" + std::to_string(now.wall_time) +
+                             ",\"l\":" + std::to_string(now.logical) +
+                             ",\"n\":" + std::to_string(now.node_id) + "}";
+
+      wal_batch.push_back({WalOp::PUT, key, val});
+      wal_batch.push_back({WalOp::PUT, mkey_s, meta_val});
+
+      shard_works[get_routing_shard(key)].updates.push_back({key, val});
+      shard_works[get_routing_shard(mkey_s)].updates.push_back({mkey_s, meta_val});
+    }
+
+    if (wal_batch.empty())
+      return;
+
+    wal_->append_batch(wal_batch);
+
+    for (auto &[shard_idx, work] : shard_works) {
+      auto &s = *shards_[shard_idx];
+      s.messages.enqueue({[this, updates = std::move(work.updates)]() mutable {
+        for (auto &p : updates) {
+          apply_put(p.first, p.second);
+        }
+      }});
+    }
+  }
+
+  lite3cpp::Buffer batch_get(const std::vector<std::string> &keys) {
+    lite3cpp::Buffer res;
+    res.init_object();
+    for (const auto &k : keys) {
+      auto view = get_view(k);
+      if (view) {
+        if (view->compressed_) {
+          std::string src(reinterpret_cast<const char *>(view->buf_.data()), view->buf_.size());
+          std::string dst;
+          zstd_manager_->decompress(src, dst, view->original_size_);
+          res.set_str(0, k, dst);
+        } else {
+          auto v = view->view();
+          res.set_bytes(0, k, std::span<const std::byte>(reinterpret_cast<const std::byte *>(v.data()), v.size()));
+        }
+      }
+    }
+    return res;
+  }
+
   inline void apply_mutation(const Mutation &m) {
     std::string_view meta_key_v = KeyBuilder::meta_key(m.key);
     std::string meta_key_lookup(meta_key_v);
@@ -669,6 +721,8 @@ public:
     apply_put(meta_key_lookup, meta_val);
   }
 
+  void set_logger(std::shared_ptr<ILogger> logger) { logger_ = logger; }
+  ZstdManager* get_zstd_manager() const { return zstd_manager_.get(); }
   void flush() { wal_->flush(); }
   void wait_all_shards() {
     std::vector<std::future<void>> futures;
@@ -723,14 +777,10 @@ public:
           if (it->second->buf_.size() > 0) {
             std::string vstr;
             if (it->second->compressed_) {
-              std::string src(
-                  reinterpret_cast<const char *>(it->second->buf_.data()),
-                  it->second->buf_.size());
+              std::string src(reinterpret_cast<const char *>(it->second->buf_.data()), it->second->buf_.size());
               zstd_manager_->decompress(src, vstr, it->second->original_size_);
             } else {
-              vstr = std::string(
-                  reinterpret_cast<const char *>(it->second->buf_.data()),
-                  it->second->buf_.size());
+              vstr = std::string(reinterpret_cast<const char *>(it->second->buf_.data()), it->second->buf_.size());
             }
             chunk.push_back({it->first, std::move(vstr)});
             if (chunk.size() >= limit)

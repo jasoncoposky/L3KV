@@ -42,11 +42,33 @@ set(XXHASH_BUILD_ALIASES ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(xxhash)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/_deps/xxhash-src)
 
+# ZeroMQ & cppzmq
+include(FetchContent)
+
+FetchContent_Declare(
+  libzmq
+  GIT_REPOSITORY https://github.com/zeromq/libzmq.git
+  GIT_TAG        v4.3.5
+)
+set(ZMQ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(libzmq)
+
+FetchContent_Declare(
+  cppzmq
+  GIT_REPOSITORY https://github.com/zeromq/cppzmq.git
+  GIT_TAG        v4.10.0
+)
+set(CPPZMQ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(cppzmq)
+
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 add_library(l3kv_engine STATIC
     src/engine/clock.cpp
     src/engine/mesh.cpp
     src/observability/simple_metrics.cpp
 )
+
 target_include_directories(l3kv_engine PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../lib/lite3-cpp/include
@@ -63,7 +85,7 @@ target_link_libraries(l3kv_engine PUBLIC
 
 add_executable(l3svc
     src/main.cpp
-    src/http/http_server.cpp
+    src/zmq/zmq_server.cpp
     src/observability/simple_metrics.cpp
     src/engine/clock.cpp
     src/engine/mesh.cpp
@@ -81,14 +103,22 @@ target_link_libraries(l3svc PRIVATE
     Threads::Threads
     ws2_32
     bcrypt
+    iphlpapi
     lite3-cpp
     conveyor
     libzstd_static
     xxhash
+    l3kv_engine
+    libzmq
+    cppzmq
 )
+
+
+
 
 if(MSVC)
     add_definitions(-D_WIN32_WINNT=0x0A00 -DNOMINMAX -DBOOST_ASIO_HAS_IOCP)
+    target_compile_options(l3svc PRIVATE /bigobj)
 endif()
 
 if(NOT MSVC)
@@ -185,6 +215,7 @@ target_include_directories(bench_ycsb PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../lib/liblite3client/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/../lib/liblite3client/external"
     "${CMAKE_CURRENT_SOURCE_DIR}/../lib/lite3-cpp/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../lib/boost_1_89_0"
 )
 target_link_libraries(bench_ycsb PRIVATE
     lite3client
@@ -194,6 +225,13 @@ target_link_libraries(bench_ycsb PRIVATE
 add_executable(engine_bench src/tests_cpp/engine_bench.cpp src/engine/clock.cpp)
 target_include_directories(engine_bench PRIVATE src)
 target_link_libraries(engine_bench PRIVATE Threads::Threads l3kv_engine)
+
+add_executable(bench_engine_threaded src/tests_cpp/bench_engine_threaded.cpp src/engine/clock.cpp)
+target_include_directories(bench_engine_threaded PRIVATE src)
+target_link_libraries(bench_engine_threaded PRIVATE Threads::Threads l3kv_engine)
+
 if(MSVC)
     add_definitions(-D_WIN32_WINNT=0x0A00 -DNOMINMAX)
 endif()
+
+add_executable(hello src/tests_cpp/hello.cpp)

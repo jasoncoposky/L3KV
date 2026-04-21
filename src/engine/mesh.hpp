@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <buffer.hpp>
 
 namespace l3kv {
 
@@ -23,13 +24,13 @@ enum class Lane {
 class IMesh {
 public:
   using MessageCallback =
-      std::function<void(NodeID, Lane, const std::vector<uint8_t> &)>;
+      std::function<void(NodeID, Lane, const lite3cpp::Buffer &)>;
 
   virtual ~IMesh() = default;
 
   virtual void connect(NodeID peer_id, const std::string &host, int port) = 0;
   virtual bool send(NodeID peer_id, Lane lane,
-                    std::vector<uint8_t> payload) = 0;
+                    lite3cpp::Buffer payload) = 0;
   virtual void set_on_message(MessageCallback cb) = 0;
   virtual void listen() = 0;
   virtual std::vector<NodeID> get_active_peers() = 0;
@@ -45,7 +46,7 @@ public:
 
   // Send payload to peer on specific lane
   // Returns true if queued/sent, false if peer unknown or disconnected
-  bool send(NodeID peer_id, Lane lane, std::vector<uint8_t> payload) override;
+  bool send(NodeID peer_id, Lane lane, lite3cpp::Buffer payload) override;
 
   // Register callback for incoming messages
   void set_on_message(MessageCallback cb) override;
