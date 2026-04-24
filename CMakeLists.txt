@@ -15,7 +15,7 @@ endif()
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../lib/lite3-cpp ${CMAKE_CURRENT_SOURCE_DIR}/../lib/lite3-cpp/build)
 
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../lib/libconveyor ${CMAKE_CURRENT_SOURCE_DIR}/../lib/libconveyor/build)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../libconveyor ${CMAKE_CURRENT_SOURCE_DIR}/../libconveyor/build)
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../lib/liblite3client ${CMAKE_CURRENT_SOURCE_DIR}/../lib/liblite3client/build)
 
@@ -72,7 +72,7 @@ add_library(l3kv_engine STATIC
 target_include_directories(l3kv_engine PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../lib/lite3-cpp/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../lib/libconveyor/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../libconveyor/include
     "${CMAKE_CURRENT_SOURCE_DIR}/../lib/boost_1_89_0"
     ${CMAKE_CURRENT_SOURCE_DIR}/_deps/zstd-src/lib
 )
@@ -94,7 +94,7 @@ add_executable(l3svc
 target_include_directories(l3svc PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../lib/lite3-cpp/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../lib/libconveyor/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../libconveyor/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../lib/liblite3client/external
     "${CMAKE_CURRENT_SOURCE_DIR}/../lib/boost_1_89_0"
 )
@@ -123,7 +123,7 @@ endif()
 
 if(NOT MSVC)
     target_compile_options(l3svc PRIVATE -O3 -march=native)
-    add_definitions(-DBOOST_ASIO_HAS_IO_URING -DBOOST_ASIO_DISABLE_EPOLL)
+    # add_definitions(-DBOOST_ASIO_HAS_IO_URING -DBOOST_ASIO_DISABLE_EPOLL)
 endif()
 
 add_executable(test_clock src/tests_cpp/test_clock.cpp src/engine/clock.cpp)

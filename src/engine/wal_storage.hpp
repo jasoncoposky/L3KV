@@ -84,5 +84,34 @@ struct WindowsStorage {
 } // namespace wal
 
 #else
-// POSIX implementation placeholder
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/types.h>
+
+namespace wal {
+
+struct POSIXStorage {
+  static ssize_t pwrite_impl(storage_handle_t handle, const void *buf,
+                             size_t count, off_t offset) {
+    int fd = (int)(intptr_t)handle;
+    return pwrite(fd, buf, count, offset);
+  }
+
+  static ssize_t pread_impl(storage_handle_t handle, void *buf, size_t count,
+                            off_t offset) {
+    int fd = (int)(intptr_t)handle;
+    return pread(fd, buf, count, offset);
+  }
+
+  static off_t lseek_impl(storage_handle_t handle, off_t offset, int whence) {
+    int fd = (int)(intptr_t)handle;
+    return lseek(fd, offset, whence);
+  }
+
+  static storage_operations_t get_ops() {
+    return {pwrite_impl, (ssize_t(*)(storage_handle_t, void*, size_t, off_t))pread_impl, lseek_impl};
+  }
+};
+
+} // namespace wal
 #endif

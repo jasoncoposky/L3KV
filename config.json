@@ -1,13 +1,13 @@
 {
-    "server": {
-        "address": "0.0.0.0",
-        "port": 8080,
-        "min_threads": 4,
-        "max_threads": 16
-    },
-    "storage": {
-        "wal_path": "data.wal"
-    },
+    "address": "127.0.0.1",
+    "port": 8080,
+    "min_threads": 4,
+    "max_threads": 16,
+    "wal_path": "data.wal",
     "node_id": 1,
-    "mesh_port": 9090
+    "mesh_port": 9090,
+    "cluster": {
+        "mode": "sharded",
+        "shards": 100
+    }
 }

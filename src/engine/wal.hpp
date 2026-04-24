@@ -9,6 +9,14 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <sys/stat.h>
+#include <errno.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 #include <vector>
 
 namespace l3kv {
@@ -38,8 +46,14 @@ struct LogHeader {
 
 class WriteAheadLog {
   struct FileHandle {
+#ifdef _WIN32
     HANDLE h;
+#else
+    int fd;
+#endif
+
     FileHandle(const std::string &p) {
+#ifdef _WIN32
       h = CreateFileA(p.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
                       NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
       if (h == INVALID_HANDLE_VALUE) {
@@ -47,10 +61,30 @@ class WriteAheadLog {
         throw std::runtime_error("Failed to open WAL file: " + p +
                                  " Error: " + std::to_string(err));
       }
+#else
+      fd = open(p.c_str(), O_RDWR | O_CREAT, 0644);
+      if (fd < 0) {
+        throw std::runtime_error("Failed to open WAL file: " + p +
+                                 " Error: " + std::to_string(errno));
+      }
+#endif
     }
     ~FileHandle() {
+#ifdef _WIN32
       if (h != INVALID_HANDLE_VALUE)
         CloseHandle(h);
+#else
+      if (fd >= 0)
+        close(fd);
+#endif
+    }
+
+    storage_handle_t get() const {
+#ifdef _WIN32
+      return (storage_handle_t)h;
+#else
+      return (storage_handle_t)(intptr_t)fd;
+#endif
     }
   };
 
@@ -149,20 +183,55 @@ public:
       std::function<void(WalOp, std::string_view, std::string_view)>;
 
   void recover(RecoverCallback callback) {
+    uint64_t fileSize64 = 0;
+#ifdef _WIN32
     LARGE_INTEGER fileSize;
     if (!GetFileSizeEx(file_.h, &fileSize)) return;
+    fileSize64 = fileSize.QuadPart;
+#else
+    struct stat st;
+    if (fstat(file_.fd, &st) < 0) return;
+    fileSize64 = st.st_size;
+#endif
 
-    if (fileSize.QuadPart > 0) {
+    if (fileSize64 > 0) {
         uint64_t current_offset = 0;
-        while (current_offset < (uint64_t)fileSize.QuadPart) {
+#ifdef _WIN32
+        SetFilePointer(file_.h, 0, NULL, FILE_BEGIN);
+#else
+        lseek(file_.fd, 0, SEEK_SET);
+#endif
+
+        while (current_offset < fileSize64) {
             LogHeader h;
-            DWORD read = 0;
-            if (!ReadFile(file_.h, &h, sizeof(h), &read, NULL) || read != sizeof(h)) break;
+            size_t header_read = 0;
+#ifdef _WIN32
+            DWORD win_read = 0;
+            if (!ReadFile(file_.h, &h, sizeof(h), &win_read, NULL) || win_read != sizeof(h)) break;
+            header_read = win_read;
+#else
+            ssize_t posix_read = read(file_.fd, &h, sizeof(h));
+            if (posix_read != sizeof(h)) break;
+            header_read = posix_read;
+#endif
 
             std::string key(h.key_len, '\0');
             std::string payload(h.payload_len, '\0');
-            if (h.key_len > 0) ReadFile(file_.h, key.data(), h.key_len, &read, NULL);
-            if (h.payload_len > 0) ReadFile(file_.h, payload.data(), h.payload_len, &read, NULL);
+            
+            if (h.key_len > 0) {
+#ifdef _WIN32
+                ReadFile(file_.h, key.data(), h.key_len, &win_read, NULL);
+#else
+                read(file_.fd, key.data(), h.key_len);
+#endif
+            }
+            if (h.payload_len > 0) {
+#ifdef _WIN32
+                ReadFile(file_.h, payload.data(), h.payload_len, &win_read, NULL);
+#else
+                read(file_.fd, payload.data(), h.payload_len);
+#endif
+            }
 
             if (compute_crc(h.op, key, payload) != h.crc) break;
 
@@ -189,13 +258,21 @@ public:
                 callback((WalOp)h.op, key, payload);
             }
         }
+#ifdef _WIN32
         LARGE_INTEGER li; li.QuadPart = 0;
         SetFilePointerEx(file_.h, li, NULL, FILE_END);
+#else
+        lseek(file_.fd, 0, SEEK_END);
+#endif
     }
 
     libconveyor::v2::Config cfg;
-    cfg.handle = (storage_handle_t)file_.h;
+    cfg.handle = file_.get();
+#ifdef _WIN32
     cfg.ops = wal::WindowsStorage::get_ops();
+#else
+    cfg.ops = wal::POSIXStorage::get_ops();
+#endif
     cfg.write_capacity = 20 * 1024 * 1024;
     cfg.read_capacity = 5 * 1024 * 1024;
 
