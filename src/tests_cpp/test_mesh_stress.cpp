@@ -22,7 +22,7 @@ void test_mesh_concurrency() {
   // We can't verify order across threads easily, but we checks count and
   // integrity.
   server.set_on_message(
-      [&](NodeID id, Lane lane, const std::vector<uint8_t> &pay) {
+      [&](NodeID id, Lane lane, const lite3cpp::Buffer &pay) {
         received_count++;
       });
 
@@ -52,7 +52,8 @@ void test_mesh_concurrency() {
         Lane l = (m % 2 == 0) ? Lane::Standard : Lane::Express;
         // Retry loop (connection might be async establishing)
         // But verify test_phase2 showed fast connect.
-        client.send(10, l, std::vector<uint8_t>(msg.begin(), msg.end()));
+        std::vector<uint8_t> msg_vec(msg.begin(), msg.end());
+        client.send(10, l, lite3cpp::Buffer(std::move(msg_vec)));
         // Small yield to mix threads
         if (m % 100 == 0)
           std::this_thread::yield();
@@ -95,15 +96,16 @@ void test_large_payload() {
   size_t received_size = 0;
 
   server.set_on_message(
-      [&](NodeID id, Lane lane, const std::vector<uint8_t> &pay) {
+      [&](NodeID id, Lane lane, const lite3cpp::Buffer &pay) {
         received_size = pay.size();
         // Spot check content
         bool all_match = true;
+        const uint8_t* p_data = pay.data();
         for (size_t i = 0; i < pay.size(); i += 1024) { // Check every 1KB
-          if (pay[i] != 'A')
+          if (p_data[i] != 'A')
             all_match = false;
         }
-        if (pay.size() > 0 && pay.back() != 'A')
+        if (pay.size() > 0 && p_data[pay.size()-1] != 'A')
           all_match = false;
 
         if (all_match && lane == Lane::Heavy)
@@ -121,8 +123,8 @@ void test_large_payload() {
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
   // Create 1MB payload
-  std::vector<uint8_t> big_load(1024 * 1024, 'A');
-  client.send(11, Lane::Heavy, big_load);
+  std::vector<uint8_t> big_load_vec(1024 * 1024, 'A');
+  client.send(11, Lane::Heavy, lite3cpp::Buffer(std::move(big_load_vec)));
 
   // Wait
   for (int i = 0; i < 50; ++i) {

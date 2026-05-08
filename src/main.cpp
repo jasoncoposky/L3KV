@@ -154,8 +154,7 @@ int main(int argc, char *argv[]) {
     mesh.set_on_message([&](l3kv::NodeID from, l3kv::Lane lane,
                             const lite3cpp::Buffer &payload) {
       if (lane == l3kv::Lane::Control) {
-        std::vector<uint8_t> vec_payload(payload.data(), payload.data() + payload.size());
-        sync.handle_message(from, vec_payload);
+        sync.handle_message(from, payload);
       }
     });
 

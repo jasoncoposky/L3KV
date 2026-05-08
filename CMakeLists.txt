@@ -12,12 +12,12 @@ set(LITE3CPP_DISABLE_OBSERVABILITY OFF CACHE BOOL "" FORCE)
 if(LITE3CPP_DISABLE_OBSERVABILITY)
     add_compile_definitions(LITE3CPP_DISABLE_OBSERVABILITY)
 endif()
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../lib/lite3-cpp ${CMAKE_CURRENT_SOURCE_DIR}/../lib/lite3-cpp/build)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../lib/lite3-cpp ${CMAKE_CURRENT_BINARY_DIR}/lite3-cpp)
 
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../libconveyor ${CMAKE_CURRENT_SOURCE_DIR}/../libconveyor/build)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../libconveyor ${CMAKE_CURRENT_BINARY_DIR}/libconveyor)
 
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../lib/liblite3client ${CMAKE_CURRENT_SOURCE_DIR}/../lib/liblite3client/build)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../lib/liblite3client ${CMAKE_CURRENT_BINARY_DIR}/liblite3client)
 
 include(FetchContent)
 FetchContent_Declare(

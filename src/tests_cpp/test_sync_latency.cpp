@@ -26,7 +26,7 @@ public:
     NodeID from;
     NodeID to;
     Lane lane;
-    std::vector<uint8_t> payload;
+    lite3cpp::Buffer payload;
   };
 
   std::deque<Packet> queue;
@@ -41,12 +41,12 @@ public:
     latencies[{b, a}] = ms;
   }
 
-  void send(NodeID from, NodeID to, Lane lane, std::vector<uint8_t> pay) {
+  void send(NodeID from, NodeID to, Lane lane, lite3cpp::Buffer pay) {
     uint64_t delay = 1; // Default
     if (latencies.count({from, to})) {
       delay = latencies.at({from, to});
     }
-    Packet p = {current_time + delay, from, to, lane, pay};
+    Packet p = {current_time + delay, from, to, lane, std::move(pay)};
     // Insert sorted (simple linear scan is fine for test scale)
     auto it = queue.begin();
     while (it != queue.end() && it->delivery_time <= p.delivery_time) {
@@ -73,8 +73,8 @@ public:
   void connect(NodeID, const std::string &, int) override {} // No-op
   void listen() override {}                                  // No-op
 
-  bool send(NodeID peer_id, Lane lane, std::vector<uint8_t> payload) override {
-    net_.send(my_id_, peer_id, lane, payload);
+  bool send(NodeID peer_id, Lane lane, lite3cpp::Buffer payload) override {
+    net_.send(my_id_, peer_id, lane, std::move(payload));
     return true;
   }
 
@@ -89,7 +89,7 @@ public:
     return peers;
   }
 
-  void deliver(NodeID from, Lane lane, const std::vector<uint8_t> &pay) {
+  void deliver(NodeID from, Lane lane, const lite3cpp::Buffer &pay) {
     if (cb_)
       cb_(from, lane, pay);
   }
@@ -101,7 +101,7 @@ public:
 void VirtualNetwork::step(uint64_t ms) {
   uint64_t end_time = current_time + ms;
   while (!queue.empty() && queue.front().delivery_time <= end_time) {
-    Packet p = queue.front();
+    Packet p = std::move(queue.front());
     queue.pop_front();
     current_time = p.delivery_time; // Warp to event
 
@@ -127,7 +127,7 @@ struct Node {
 
     // Wire up
     mesh->set_on_message(
-        [this](NodeID from, Lane, const std::vector<uint8_t> &pay) {
+        [this](NodeID from, Lane, const lite3cpp::Buffer &pay) {
           sync->handle_message(from, pay);
         });
   }

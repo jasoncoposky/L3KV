@@ -45,8 +45,8 @@ void test_mesh_loopback() {
 
   std::atomic<int> received_count{0};
   server.set_on_message(
-      [&](NodeID id, Lane lane, const std::vector<uint8_t> &pay) {
-        std::string s(pay.begin(), pay.end());
+      [&](NodeID id, Lane lane, const lite3cpp::Buffer &pay) {
+        std::string s(reinterpret_cast<const char*>(pay.data()), pay.size());
         std::cout << "Server received on lane " << (int)lane << ": " << s
                   << std::endl;
         received_count++;

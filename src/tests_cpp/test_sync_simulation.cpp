@@ -38,11 +38,11 @@ struct Node {
     // If it matches Sync types, handle it.
 
     mesh->set_on_message(
-        [this](NodeID from, Lane lane, const std::vector<uint8_t> &pay) {
-          if (pay.empty())
+        [this](NodeID from, Lane lane, const lite3cpp::Buffer &pay) {
+          if (pay.size() == 0)
             return;
           // Check if Sync Message
-          uint8_t type = pay[0];
+          uint8_t type = pay.data()[0];
           // Sync types are 0x01..0x07 as defined in sync_manager.hpp
           if (type >= 1 && type <= 7) {
             std::cerr << "[Test] Node " << id << " Recv Type " << (int)type

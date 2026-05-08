@@ -301,56 +301,33 @@ private:
     return fnv1a_64(v.data(), v.size());
   }
 
-  void apply_put(const std::string &key, const std::string &json_body) {
-    auto &s = get_shard(key);
+  void apply_put(std::string_view key, std::string_view json_body) {
+    auto &s = get_shard(std::string(key));
     std::unique_lock lock(s.read_mu);
 
     uint64_t old_h = 0;
-    auto it = s.map.find(key);
+    auto it = s.map.find(std::string(key));
     if (it != s.map.end()) {
       old_h = hash_blob(it->second);
     }
 
     auto new_blob = std::make_shared<Blob>(&s.pool);
-    new_blob->overwrite(json_body, zstd_manager_.get());
+    new_blob->overwrite(std::string(json_body), zstd_manager_.get());
     uint64_t new_h = hash_blob(new_blob);
     
-    s.map[key] = std::move(new_blob);
-    merkle_.apply_delta(key, old_h ^ new_h);
+    s.map[std::string(key)] = std::move(new_blob);
+    merkle_.apply_delta(std::string(key), old_h ^ new_h);
   }
 
-  void apply_patch_int(const std::string &key, const std::string &field,
+  void apply_patch_int(std::string_view key, std::string_view field,
                        int64_t val) {
-    auto &s = get_shard(key);
+    auto &s = get_shard(std::string(key));
     std::unique_lock lock(s.read_mu);
     
     uint64_t old_h = 0;
     std::shared_ptr<Blob> new_blob;
     
-    auto it = s.map.find(key);
-    if (it != s.map.end()) {
-      old_h = hash_blob(it->second);
-      new_blob = std::make_shared<Blob>(*it->second); // Copy constructor needed
-    } else {
-      new_blob = std::make_shared<Blob>(&s.pool);
-    }
-
-    new_blob->set_int(field, val, zstd_manager_.get());
-    uint64_t new_h = hash_blob(new_blob);
-    
-    s.map[key] = std::move(new_blob);
-    merkle_.apply_delta(key, old_h ^ new_h);
-  }
-
-  void apply_patch_str(const std::string &key, const std::string &field,
-                       const std::string &val) {
-    auto &s = get_shard(key);
-    std::unique_lock lock(s.read_mu);
-    
-    uint64_t old_h = 0;
-    std::shared_ptr<Blob> new_blob;
-    
-    auto it = s.map.find(key);
+    auto it = s.map.find(std::string(key));
     if (it != s.map.end()) {
       old_h = hash_blob(it->second);
       new_blob = std::make_shared<Blob>(*it->second);
@@ -358,29 +335,52 @@ private:
       new_blob = std::make_shared<Blob>(&s.pool);
     }
 
-    new_blob->set_str(field, val, zstd_manager_.get());
+    new_blob->set_int(std::string(field), val, zstd_manager_.get());
     uint64_t new_h = hash_blob(new_blob);
     
-    s.map[key] = std::move(new_blob);
-    merkle_.apply_delta(key, old_h ^ new_h);
+    s.map[std::string(key)] = std::move(new_blob);
+    merkle_.apply_delta(std::string(key), old_h ^ new_h);
   }
 
-  bool apply_del(const std::string &key) {
-    auto &s = get_shard(key);
+  void apply_patch_str(std::string_view key, std::string_view field,
+                       std::string_view val) {
+    auto &s = get_shard(std::string(key));
+    std::unique_lock lock(s.read_mu);
+    
+    uint64_t old_h = 0;
+    std::shared_ptr<Blob> new_blob;
+    
+    auto it = s.map.find(std::string(key));
+    if (it != s.map.end()) {
+      old_h = hash_blob(it->second);
+      new_blob = std::make_shared<Blob>(*it->second);
+    } else {
+      new_blob = std::make_shared<Blob>(&s.pool);
+    }
+
+    new_blob->set_str(std::string(field), std::string(val), zstd_manager_.get());
+    uint64_t new_h = hash_blob(new_blob);
+    
+    s.map[std::string(key)] = std::move(new_blob);
+    merkle_.apply_delta(std::string(key), old_h ^ new_h);
+  }
+
+  bool apply_del(std::string_view key) {
+    auto &s = get_shard(std::string(key));
     std::unique_lock lock(s.read_mu);
 
     uint64_t old_h = 0;
-    auto it = s.map.find(key);
+    auto it = s.map.find(std::string(key));
     if (it != s.map.end()) {
         old_h = hash_blob(it->second);
     }
 
     auto new_blob = std::make_shared<Blob>(&s.pool);
-    new_blob->overwrite("", zstd_manager_.get()); // Set to empty (Tombstone)
+    new_blob->overwrite("", zstd_manager_.get());
     uint64_t new_h = hash_blob(new_blob);
 
-    s.map[key] = std::move(new_blob);
-    merkle_.apply_delta(key, old_h ^ new_h);
+    s.map[std::string(key)] = std::move(new_blob);
+    merkle_.apply_delta(std::string(key), old_h ^ new_h);
     return true;
   }
 
@@ -395,14 +395,14 @@ public:
         [this](WalOp op, std::string_view key, std::string_view payload) {
           try {
             if (op == WalOp::PUT) {
-              apply_put(std::string(key), std::string(payload));
+              apply_put(key, payload);
             } else if (op == WalOp::PATCH_I64) {
               std::string p(payload);
               size_t colon = p.find(':');
               if (colon != std::string::npos) {
                 std::string field = p.substr(0, colon);
                 int64_t val = std::stoll(p.substr(colon + 1));
-                apply_patch_int(std::string(key), field, val);
+                apply_patch_int(key, field, val);
               }
             } else if (op == WalOp::PATCH_STR) {
               std::string p(payload);
@@ -410,10 +410,10 @@ public:
               if (colon != std::string::npos) {
                 std::string field = p.substr(0, colon);
                 std::string val = p.substr(colon + 1);
-                apply_patch_str(std::string(key), field, val);
+                apply_patch_str(key, field, val);
               }
             } else if (op == WalOp::DELETE_) {
-              apply_del(std::string(key));
+              apply_del(key);
             }
           } catch (const std::exception &e) {
             std::cerr << "WAL Recovery Skip: " << e.what() << "\n";
@@ -479,8 +479,8 @@ public:
     return fut;
   }
 
-  template <typename Func> void submit_async(const std::string &key, Func &&f) {
-    size_t h = get_routing_shard(key);
+  template <typename Func> void submit_async(std::string_view key, Func &&f) {
+    size_t h = get_routing_shard(std::string(key));
     auto &s = *shards_[h];
     s.messages.enqueue({[f = std::forward<Func>(f)]() mutable { f(); }});
   }
@@ -517,7 +517,7 @@ public:
     return view->buf_;
   }
 
-  void put(std::string key, const std::string &json_body) {
+  void put(std::string key, std::string json_body) {
     auto now = clock_.now();
     std::string_view mkey_v = KeyBuilder::meta_key(key);
     std::string mkey_s(mkey_v);
@@ -531,7 +531,7 @@ public:
 
     wal_->append_batch(batch);
 
-    submit_async(key, [this, key, json_body, mkey_s, meta_val]() {
+    submit_async(key, [this, key = std::move(key), json_body = std::move(json_body), mkey_s = std::move(mkey_s), meta_val = std::move(meta_val)]() mutable {
       apply_put(key, json_body);
       apply_put(mkey_s, meta_val);
     });
@@ -554,7 +554,7 @@ public:
 
     wal_->append_batch(batch);
 
-    submit_async(key, [this, key, field, val, mkey_s, ts_str]() {
+    submit_async(key, [this, key = std::move(key), field = std::move(field), val, mkey_s = std::move(mkey_s), ts_str = std::move(ts_str)]() mutable {
       apply_patch_int(key, field, val);
       apply_patch_str(mkey_s, field, ts_str);
     });
@@ -577,7 +577,7 @@ public:
 
     wal_->append_batch(batch);
 
-    submit_async(key, [this, key, field, val, mkey_s, ts_str]() {
+    submit_async(key, [this, key = std::move(key), field = std::move(field), val = std::move(val), mkey_s = std::move(mkey_s), ts_str = std::move(ts_str)]() mutable {
       apply_patch_str(key, field, val);
       apply_patch_str(mkey_s, field, ts_str);
     });

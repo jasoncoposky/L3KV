@@ -31,8 +31,8 @@ enum class WalOp : uint8_t {
 
 struct BatchOp {
   WalOp op;
-  std::string key;
-  std::string value;
+  std::string_view key;
+  std::string_view value;
 };
 
 #pragma pack(push, 1)
@@ -123,10 +123,8 @@ public:
     uint32_t crc = compute_crc((uint8_t)op, key, payload);
     size_t total_len = sizeof(LogHeader) + key.size() + payload.size();
 
-    void* dst = conveyor_reserve(wal_->impl_for_c_api(), total_len);
-    if (!dst) return;
-
-    uint8_t* ptr = static_cast<uint8_t*>(dst);
+    std::vector<uint8_t> buffer(total_len);
+    uint8_t* ptr = buffer.data();
     
     LogHeader h{crc, (uint8_t)op, (uint16_t)key.size(), (uint32_t)payload.size()};
     std::memcpy(ptr, &h, sizeof(h));
@@ -137,7 +135,7 @@ public:
     
     std::memcpy(ptr, payload.data(), payload.size());
     
-    conveyor_commit(wal_->impl_for_c_api(), total_len);
+    wal_->write(buffer);
   }
 
   void append_batch(const std::vector<BatchOp> &ops) {
@@ -149,10 +147,8 @@ public:
     }
 
     size_t total_len = sizeof(LogHeader) + payload_size;
-    void* dst = conveyor_reserve(wal_->impl_for_c_api(), total_len);
-    if (!dst) return;
-
-    uint8_t* ptr = static_cast<uint8_t*>(dst);
+    std::vector<uint8_t> buffer(total_len);
+    uint8_t* ptr = buffer.data();
     uint8_t* payload_start = ptr + sizeof(LogHeader);
 
     // Format payload directly
@@ -176,7 +172,7 @@ public:
     LogHeader h{crc, (uint8_t)WalOp::BATCH, 0, (uint32_t)payload_size};
     std::memcpy(ptr, &h, sizeof(h));
 
-    conveyor_commit(wal_->impl_for_c_api(), total_len);
+    wal_->write(buffer);
   }
 
   using RecoverCallback =

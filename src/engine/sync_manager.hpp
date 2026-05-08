@@ -65,9 +65,13 @@ public:
 
   // Handle incoming Control messages
   void handle_message(NodeID /*ignored_from*/,
-                      const std::vector<uint8_t> &payload) {
-    if (payload.size() < 5)
+                      const lite3cpp::Buffer &payload_buf) {
+    if (payload_buf.size() < 5)
       return;
+    
+    // Copy to vector for internal handlers that expect vector
+    std::vector<uint8_t> payload(payload_buf.data(), payload_buf.data() + payload_buf.size());
+
     MsgType type = (MsgType)payload[0];
     NodeID sender_id;
     std::memcpy(&sender_id, &payload[1], 4);
