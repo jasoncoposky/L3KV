@@ -825,13 +825,15 @@ public:
       futures.push_back(submit_to_shard_idx(i, [this, i, prefix, start_key, limit_per_shard]() {
         std::vector<std::string> chunk;
         auto &s = *shards_[i];
-        auto it = s.map.lower_bound(start_key);
+        
+        std::string effective_start = start_key;
+        if (effective_start < prefix) effective_start = prefix;
+        
+        auto it = s.map.lower_bound(effective_start);
         while (it != s.map.end() && it->first.starts_with(prefix)) {
-          if (it->first >= start_key) {
-            chunk.push_back(it->first);
-            if (chunk.size() >= limit_per_shard)
-              break;
-          }
+          chunk.push_back(it->first);
+          if (chunk.size() >= limit_per_shard)
+            break;
           ++it;
         }
         return chunk;
