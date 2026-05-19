@@ -4,6 +4,7 @@
 #include "replication_log.hpp"
 #include "wal.hpp"
 #include "KeyBuilder.hpp"
+#include "credential_manager.hpp"
 
 #include <functional>
 #include <iostream>
@@ -269,9 +270,12 @@ class Engine {
   HybridLogicalClock clock_;
   MerkleTree merkle_;
   std::unique_ptr<ZstdManager> zstd_manager_;
+  std::unique_ptr<CredentialManager> credentials_;
 
 
 public:
+  CredentialManager& credentials() { return *credentials_; }
+
   size_t get_routing_shard(const std::string &key) {
     size_t start = key.find('{');
     if (start != std::string::npos) {
@@ -388,6 +392,12 @@ public:
   Engine(std::string wal_path, uint32_t node_id = 1) : clock_(node_id) {
     wal_ = std::make_unique<WriteAheadLog>(wal_path);
     zstd_manager_ = std::make_unique<ZstdManager>();
+    credentials_ = std::make_unique<CredentialManager>(this);
+    credentials_->register_user(ADMIN_UID, "admin", "admin-key");
+    credentials_->set_acl(ADMIN_UID, "*", Permission::ADMIN);
+    credentials_->register_user(INTERNAL_UID, "internal", "internal-key");
+    credentials_->set_acl(INTERNAL_UID, "*", Permission::ADMIN);
+
     for (size_t i = 0; i < SHARDS; ++i)
       shards_.push_back(std::make_unique<Shard>());
 

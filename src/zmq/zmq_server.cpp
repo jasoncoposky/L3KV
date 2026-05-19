@@ -47,12 +47,59 @@ void ZmqServer::run() {
             }
 
             auto& identity = recv_msgs[0];
+            auto identity_str = identity.to_string();
             auto& opcode_msg = recv_msgs[2];
             if (opcode_msg.size() == 0) continue;
             char opcode = *static_cast<char*>(opcode_msg.data());
 
+            if (opcode == 'A' && recv_msgs.size() >= 5) {
+                // AUTH [ClientUID] [Secret]
+                uint32_t uid = std::stoul(recv_msgs[3].to_string());
+                std::string secret = recv_msgs[4].to_string();
+                
+                if (server_secret_.empty() || secret == server_secret_) {
+                    session_identities_[identity_str] = uid;
+                    std::cout << "[ZmqServer] Auth SUCCESS for UID " << uid << " (identity=" << identity_str << ")" << std::endl;
+                    socket.send(identity, zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t("OK", 2), zmq::send_flags::none);
+                } else {
+                    std::cerr << "[ZmqServer] Auth FAILED for UID " << uid << std::endl;
+                    socket.send(identity, zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t("ERR_AUTH", 8), zmq::send_flags::none);
+                }
+                continue;
+            }
+
+            // Check if identity is authenticated
+            if (!session_identities_.contains(identity_str)) {
+                // For backward compatibility during migration, if server_secret is empty, allow anonymous
+                if (!server_secret_.empty()) {
+                    std::cerr << "[ZmqServer] Rejected unauthenticated message from " << identity_str << std::endl;
+                    socket.send(identity, zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t("ERR_UNAUTH", 8), zmq::send_flags::none);
+                    continue;
+                }
+                // If no secret, treat as anonymous user 0
+                session_identities_[identity_str] = 0; 
+            }
+
+            uint32_t current_uid = session_identities_[identity_str];
+
             if (opcode == 'G' && recv_msgs.size() >= 4) {
                 std::string key = recv_msgs[3].to_string();
+                
+                // Permission Check
+                auto perm = engine_->credentials().check_permission(current_uid, key);
+                if (!(perm & Permission::READ) && !(perm & Permission::ADMIN)) {
+                    socket.send(identity, zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t("ERR_FORBIDDEN", 13), zmq::send_flags::none);
+                    continue;
+                }
+
                 lite3cpp::Buffer val = engine_->get(key);
                 
                 socket.send(identity, zmq::send_flags::sndmore);
@@ -63,14 +110,31 @@ void ZmqServer::run() {
                 std::string key = recv_msgs[3].to_string();
                 std::string val = recv_msgs[4].to_string();
                 
+                // Permission Check
+                auto perm = engine_->credentials().check_permission(current_uid, key);
+                if (!(perm & Permission::WRITE) && !(perm & Permission::ADMIN)) {
+                    socket.send(identity, zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t("ERR_FORBIDDEN", 13), zmq::send_flags::none);
+                    continue;
+                }
+
                 engine_->put(key, val);
                 socket.send(identity, zmq::send_flags::sndmore);
                 socket.send(zmq::message_t(), zmq::send_flags::sndmore);
                 socket.send(zmq::message_t("OK", 2), zmq::send_flags::none);
             }
             else if (opcode == 'B' && recv_msgs.size() >= 4) {
+                // BATCH operations require ADMIN for now
+                auto perm = engine_->credentials().check_permission(current_uid, "*");
+                if (!(perm & Permission::ADMIN)) {
+                    socket.send(identity, zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t("ERR_FORBIDDEN", 13), zmq::send_flags::none);
+                    continue;
+                }
+
                 auto& batch_msg = recv_msgs[3];
-                // Use a managed copy to avoid lifetime issues
                 std::vector<uint8_t> vec((uint8_t*)batch_msg.data(), (uint8_t*)batch_msg.data() + batch_msg.size());
                 lite3cpp::Buffer batch_buf(std::move(vec));
                 

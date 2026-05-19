@@ -51,6 +51,9 @@ FetchContent_Declare(
   GIT_TAG        v4.3.5
 )
 set(ZMQ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ENABLE_CURVE ON CACHE BOOL "" FORCE)
+set(WITH_TWEETNACL ON CACHE BOOL "" FORCE)
+set(ZMQ_BUILD_TWEETNACL ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(libzmq)
 
 FetchContent_Declare(
@@ -160,6 +163,13 @@ target_link_libraries(test_phase2 PRIVATE
 add_executable(test_merkle src/tests_cpp/test_merkle.cpp)
 target_include_directories(test_merkle PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR}/_deps/xxhash-src)
 target_link_libraries(test_merkle PRIVATE Threads::Threads xxhash)
+
+add_executable(check_curve src/tests_cpp/check_curve.cpp)
+target_link_libraries(check_curve PRIVATE libzmq)
+
+add_executable(test_credentials src/tests_cpp/test_credentials.cpp)
+target_include_directories(test_credentials PRIVATE src)
+target_link_libraries(test_credentials PRIVATE Threads::Threads)
 
 add_executable(test_mesh_stress src/tests_cpp/test_mesh_stress.cpp)
 target_include_directories(test_mesh_stress PRIVATE

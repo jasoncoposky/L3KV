@@ -52,6 +52,7 @@ struct Config {
   std::vector<PeerConfig> peers;
   std::string cluster_mode = "replicated"; // "replicated" or "sharded"
   int num_shards = 1;
+  std::string server_secret;
 };
 
 Config load_config(const std::string &path) {
@@ -75,6 +76,7 @@ Config load_config(const std::string &path) {
     cfg.node_id = j.value("node_id", cfg.node_id);
     cfg.mesh_port = j.value("mesh_port", cfg.mesh_port);
     cfg.mesh_threads = j.value("mesh_threads", cfg.mesh_threads);
+    cfg.server_secret = j.value("server_secret", "");
 
     if (j.contains("cluster")) {
       auto &c = j["cluster"];
@@ -219,6 +221,7 @@ int main(int argc, char *argv[]) {
     // Start ZeroMQ Server
     std::cout << "DEBUG: Starting ZeroMQ Server..." << std::endl;
     l3kv::ZmqServer zmq_srv(&db, cfg.address, cfg.port);
+    zmq_srv.set_secret(cfg.server_secret);
     
     std::thread mesh_thread([&io_context]() {
       io_context.run();
