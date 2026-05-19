@@ -48,23 +48,50 @@ void ZmqServer::run() {
 
             auto& identity = recv_msgs[0];
             auto identity_str = identity.to_string();
-            auto& opcode_msg = recv_msgs[2];
+            
+            // Check if identity is authenticated
+            if (!session_identities_.contains(identity_str)) {
+                // Peek at opcode for AUTH
+                if (recv_msgs.size() >= 5 && *static_cast<char*>(recv_msgs[2].data()) == 'A') {
+                    // Handshake allowed without existing session
+                } else if (!server_secret_.empty()) {
+                    std::cerr << "[ZmqServer] Rejected unauthenticated message from " << identity_str << std::endl;
+                    socket.send(identity, zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t("ERR_UNAUTH", 8), zmq::send_flags::none);
+                    continue;
+                } else {
+                    session_identities_[identity_str] = 0; // Anonymous
+                }
+            }
+
+            // New Protocol Structure: [Identity, Delimiter, EffectiveUID (4b), OpCode (1b), ...]
+            if (recv_msgs.size() < 4) continue;
+            
+            uint32_t effective_uid = 0;
+            if (recv_msgs[2].size() == 4) {
+                effective_uid = *static_cast<uint32_t*>(recv_msgs[2].data());
+            }
+
+            auto& opcode_msg = recv_msgs[3];
             if (opcode_msg.size() == 0) continue;
             char opcode = *static_cast<char*>(opcode_msg.data());
 
             if (opcode == 'A' && recv_msgs.size() >= 5) {
                 // AUTH [ClientUID] [Secret]
-                uint32_t uid = std::stoul(recv_msgs[3].to_string());
-                std::string secret = recv_msgs[4].to_string();
+                // Note: Auth message uses different index if we stick to old structure for auth
+                // Let's unify it: [Identity, Delimiter, 0, 'A', UID, Secret]
+                uint32_t auth_uid = std::stoul(recv_msgs[4].to_string());
+                std::string secret = recv_msgs[5].to_string();
                 
                 if (server_secret_.empty() || secret == server_secret_) {
-                    session_identities_[identity_str] = uid;
-                    std::cout << "[ZmqServer] Auth SUCCESS for UID " << uid << " (identity=" << identity_str << ")" << std::endl;
+                    session_identities_[identity_str] = auth_uid;
+                    std::cout << "[ZmqServer] Auth SUCCESS for UID " << auth_uid << " (identity=" << identity_str << ")" << std::endl;
                     socket.send(identity, zmq::send_flags::sndmore);
                     socket.send(zmq::message_t(), zmq::send_flags::sndmore);
                     socket.send(zmq::message_t("OK", 2), zmq::send_flags::none);
                 } else {
-                    std::cerr << "[ZmqServer] Auth FAILED for UID " << uid << std::endl;
+                    std::cerr << "[ZmqServer] Auth FAILED for UID " << auth_uid << std::endl;
                     socket.send(identity, zmq::send_flags::sndmore);
                     socket.send(zmq::message_t(), zmq::send_flags::sndmore);
                     socket.send(zmq::message_t("ERR_AUTH", 8), zmq::send_flags::none);
@@ -72,77 +99,77 @@ void ZmqServer::run() {
                 continue;
             }
 
-            // Check if identity is authenticated
-            if (!session_identities_.contains(identity_str)) {
-                // For backward compatibility during migration, if server_secret is empty, allow anonymous
-                if (!server_secret_.empty()) {
-                    std::cerr << "[ZmqServer] Rejected unauthenticated message from " << identity_str << std::endl;
-                    socket.send(identity, zmq::send_flags::sndmore);
-                    socket.send(zmq::message_t(), zmq::send_flags::sndmore);
-                    socket.send(zmq::message_t("ERR_UNAUTH", 8), zmq::send_flags::none);
-                    continue;
-                }
-                // If no secret, treat as anonymous user 0
-                session_identities_[identity_str] = 0; 
+            uint32_t session_uid = session_identities_[identity_str];
+            
+            // Principal Propagation:
+            // If session is a trusted peer (ADMIN or INTERNAL), use the provided effective_uid.
+            // Otherwise, enforce the session's own UID.
+            uint32_t current_uid = session_uid;
+            if (session_uid == ADMIN_UID || session_uid == INTERNAL_UID) {
+                current_uid = effective_uid;
             }
 
-            uint32_t current_uid = session_identities_[identity_str];
-
-            if (opcode == 'G' && recv_msgs.size() >= 4) {
-                std::string key = recv_msgs[3].to_string();
-                
-                // Permission Check
-                auto perm = engine_->credentials().check_permission(current_uid, key);
-                if (!(perm & Permission::READ) && !(perm & Permission::ADMIN)) {
-                    socket.send(identity, zmq::send_flags::sndmore);
-                    socket.send(zmq::message_t(), zmq::send_flags::sndmore);
-                    socket.send(zmq::message_t("ERR_FORBIDDEN", 13), zmq::send_flags::none);
-                    continue;
-                }
-
-                lite3cpp::Buffer val = engine_->get(key);
+            if (opcode == 'G' && recv_msgs.size() >= 5) {
+                std::string key = recv_msgs[4].to_string();
+                lite3cpp::Buffer val = engine_->get(key, current_uid);
                 
                 socket.send(identity, zmq::send_flags::sndmore);
                 socket.send(zmq::message_t(), zmq::send_flags::sndmore);
                 socket.send(zmq::message_t(val.data(), val.size()), zmq::send_flags::none);
             }
-            else if (opcode == 'P' && recv_msgs.size() >= 5) {
-                std::string key = recv_msgs[3].to_string();
-                std::string val = recv_msgs[4].to_string();
+            else if (opcode == 'P' && recv_msgs.size() >= 6) {
+                std::string key = recv_msgs[4].to_string();
+                std::string val = recv_msgs[5].to_string();
                 
-                // Permission Check
-                auto perm = engine_->credentials().check_permission(current_uid, key);
-                if (!(perm & Permission::WRITE) && !(perm & Permission::ADMIN)) {
+                try {
+                    engine_->put(key, val, current_uid);
+                    socket.send(identity, zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t("OK", 2), zmq::send_flags::none);
+                } catch (const std::exception& e) {
                     socket.send(identity, zmq::send_flags::sndmore);
                     socket.send(zmq::message_t(), zmq::send_flags::sndmore);
                     socket.send(zmq::message_t("ERR_FORBIDDEN", 13), zmq::send_flags::none);
-                    continue;
                 }
+            }
+            else if (opcode == 'D' && recv_msgs.size() >= 5) {
+                std::string key = recv_msgs[4].to_string();
 
-                engine_->put(key, val);
+                bool ok = engine_->del(key, current_uid);
                 socket.send(identity, zmq::send_flags::sndmore);
                 socket.send(zmq::message_t(), zmq::send_flags::sndmore);
-                socket.send(zmq::message_t("OK", 2), zmq::send_flags::none);
+                socket.send(zmq::message_t(ok ? "OK" : "ERR_FORBIDDEN", ok ? 2 : 13), zmq::send_flags::none);
             }
-            else if (opcode == 'B' && recv_msgs.size() >= 4) {
-                // BATCH operations require ADMIN for now
-                auto perm = engine_->credentials().check_permission(current_uid, "*");
-                if (!(perm & Permission::ADMIN)) {
-                    socket.send(identity, zmq::send_flags::sndmore);
-                    socket.send(zmq::message_t(), zmq::send_flags::sndmore);
-                    socket.send(zmq::message_t("ERR_FORBIDDEN", 13), zmq::send_flags::none);
-                    continue;
+            else if (opcode == 'M' && recv_msgs.size() >= 5) {
+                // MULTI-GET [Key1] [Key2] ...
+                std::vector<std::string> keys;
+                for (size_t i = 4; i < recv_msgs.size(); ++i) {
+                    keys.push_back(recv_msgs[i].to_string());
                 }
 
-                auto& batch_msg = recv_msgs[3];
+                lite3cpp::Buffer res_buf = engine_->batch_get(keys, current_uid);
+
+                socket.send(identity, zmq::send_flags::sndmore);
+                socket.send(zmq::message_t(), zmq::send_flags::sndmore);
+                socket.send(zmq::message_t(res_buf.data(), res_buf.size()), zmq::send_flags::none);
+            }
+            else if (opcode == 'B' && recv_msgs.size() >= 5) {
+                auto& batch_msg = recv_msgs[4];
                 std::vector<uint8_t> vec((uint8_t*)batch_msg.data(), (uint8_t*)batch_msg.data() + batch_msg.size());
                 lite3cpp::Buffer batch_buf(std::move(vec));
-                
-                engine_->batch_put(batch_buf);
-                socket.send(identity, zmq::send_flags::sndmore);
-                socket.send(zmq::message_t(), zmq::send_flags::sndmore);
-                socket.send(zmq::message_t("OK", 2), zmq::send_flags::none);
-            } else {
+
+                try {
+                    engine_->batch_put(batch_buf, current_uid);
+                    socket.send(identity, zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t("OK", 2), zmq::send_flags::none);
+                } catch (const std::exception& e) {
+                    socket.send(identity, zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t(), zmq::send_flags::sndmore);
+                    socket.send(zmq::message_t("ERR_FORBIDDEN", 13), zmq::send_flags::none);
+                }
+            }
+ else {
                 std::cerr << "[ZmqServer] Unknown OpCode or missing frames: " << opcode << std::endl;
             }
         } catch (const std::exception& e) {

@@ -5,6 +5,7 @@
 #include "wal.hpp"
 #include "KeyBuilder.hpp"
 #include "credential_manager.hpp"
+#include <nlohmann/json.hpp>
 
 #include <functional>
 #include <iostream>
@@ -321,6 +322,32 @@ private:
     
     s.map[std::string(key)] = std::move(new_blob);
     merkle_.apply_delta(std::string(key), old_h ^ new_h);
+
+    // Foundational Security: Hook system keys to CredentialManager
+    if (key.starts_with("sys:u:")) {
+        try {
+            uint32_t uid = std::stoul(std::string(key.substr(6)));
+            auto j = nlohmann::json::parse(json_body);
+            credentials_->register_user(uid, j.value("name", ""), j.value("public_key", ""));
+        } catch (...) {}
+    } else if (key.starts_with("sys:acl:")) {
+        try {
+            // Format: sys:acl:{uid}:{prefix}
+            std::string sub = std::string(key.substr(8));
+            size_t colon = sub.find(':');
+            if (colon != std::string::npos) {
+                uint32_t uid = std::stoul(sub.substr(0, colon));
+                std::string prefix = sub.substr(colon + 1);
+                
+                Permission perm = Permission::NONE;
+                if (json_body.find("READ") != std::string::npos) perm = perm | Permission::READ;
+                if (json_body.find("WRITE") != std::string::npos) perm = perm | Permission::WRITE;
+                if (json_body.find("ADMIN") != std::string::npos) perm = perm | Permission::ADMIN;
+                
+                credentials_->set_acl(uid, prefix, perm);
+            }
+        } catch (...) {}
+    }
   }
 
   void apply_patch_int(std::string_view key, std::string_view field,
@@ -514,7 +541,13 @@ public:
     return result;
   }
 
-  lite3cpp::Buffer get(const std::string &key) {
+  lite3cpp::Buffer get(const std::string &key, uint32_t principal_id = ADMIN_UID) {
+    // Foundational Security: ACL Check
+    auto perm = credentials_->check_permission(principal_id, key);
+    if (!(perm & Permission::READ) && !(perm & Permission::ADMIN)) {
+        return {}; // Access Denied
+    }
+
     auto view = get_view(key);
     if (!view) return {};
 
@@ -527,7 +560,13 @@ public:
     return view->buf_;
   }
 
-  void put(std::string key, std::string json_body) {
+  void put(std::string key, std::string json_body, uint32_t principal_id = ADMIN_UID) {
+    // Foundational Security: ACL Check
+    auto perm = credentials_->check_permission(principal_id, key);
+    if (!(perm & Permission::WRITE) && !(perm & Permission::ADMIN)) {
+        throw std::runtime_error("Unauthorized: Access Denied for key " + key);
+    }
+
     auto now = clock_.now();
     std::string_view mkey_v = KeyBuilder::meta_key(key);
     std::string mkey_s(mkey_v);
@@ -593,7 +632,13 @@ public:
     });
   }
 
-  bool del(const std::string &key) {
+  bool del(const std::string &key, uint32_t principal_id = ADMIN_UID) {
+    // Foundational Security: ACL Check
+    auto perm = credentials_->check_permission(principal_id, key);
+    if (!(perm & Permission::WRITE) && !(perm & Permission::ADMIN)) {
+        return false; // Access Denied
+    }
+
     auto now = clock_.now();
     std::string_view mkey_v = KeyBuilder::meta_key(key);
     std::string mkey_s(mkey_v);
@@ -615,7 +660,7 @@ public:
     });
   }
 
-  void batch_put(const lite3cpp::Buffer &batch) {
+  void batch_put(const lite3cpp::Buffer &batch, uint32_t principal_id = ADMIN_UID) {
     std::vector<BatchOp> wal_batch;
     struct ShardWork {
       std::vector<std::pair<std::string, std::string>> updates;
@@ -625,6 +670,13 @@ public:
     size_t root = 0;
     for (auto it = batch.begin(root); it != batch.end(root); ++it) {
       std::string key(it->key);
+      
+      // Foundational Security: ACL Check
+      auto perm = credentials_->check_permission(principal_id, key);
+      if (!(perm & Permission::WRITE) && !(perm & Permission::ADMIN)) {
+          throw std::runtime_error("Unauthorized: Access Denied for key " + key);
+      }
+
       auto type = batch.get_type(root, key);
       std::string val;
       if (type == lite3cpp::Type::String) {
@@ -664,10 +716,16 @@ public:
     }
   }
 
-  lite3cpp::Buffer batch_get(const std::vector<std::string> &keys) {
+  lite3cpp::Buffer batch_get(const std::vector<std::string> &keys, uint32_t principal_id = ADMIN_UID) {
     lite3cpp::Buffer res;
     res.init_object();
     for (const auto &k : keys) {
+      // Foundational Security: ACL Check
+      auto perm = credentials_->check_permission(principal_id, k);
+      if (!(perm & Permission::READ) && !(perm & Permission::ADMIN)) {
+          continue; // Skip unauthorized key
+      }
+
       auto view = get_view(k);
       if (view) {
         if (view->compressed_) {
