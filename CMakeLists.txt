@@ -43,26 +43,31 @@ FetchContent_MakeAvailable(xxhash)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/_deps/xxhash-src)
 
 # ZeroMQ & cppzmq
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(ZMQ REQUIRED libzmq)
+if(ZMQ_FOUND AND NOT TARGET libzmq)
+    add_library(libzmq INTERFACE)
+    target_include_directories(libzmq INTERFACE ${ZMQ_INCLUDE_DIRS})
+    target_link_libraries(libzmq INTERFACE ${ZMQ_LIBRARIES})
+endif()
+
+# Force FetchContent for cppzmq to avoid system target issues
 include(FetchContent)
-
-FetchContent_Declare(
-  libzmq
-  GIT_REPOSITORY https://github.com/zeromq/libzmq.git
-  GIT_TAG        v4.3.5
-)
-set(ZMQ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(ENABLE_CURVE ON CACHE BOOL "" FORCE)
-set(WITH_TWEETNACL ON CACHE BOOL "" FORCE)
-set(ZMQ_BUILD_TWEETNACL ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(libzmq)
-
 FetchContent_Declare(
   cppzmq
   GIT_REPOSITORY https://github.com/zeromq/cppzmq.git
   GIT_TAG        v4.10.0
 )
 set(CPPZMQ_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(cppzmq)
+FetchContent_GetProperties(cppzmq)
+if(NOT cppzmq_POPULATED)
+    FetchContent_Populate(cppzmq)
+    if(NOT TARGET cppzmq)
+        add_library(cppzmq INTERFACE)
+        target_include_directories(cppzmq INTERFACE ${cppzmq_SOURCE_DIR}/include)
+        target_link_libraries(cppzmq INTERFACE libzmq)
+    endif()
+endif()
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 

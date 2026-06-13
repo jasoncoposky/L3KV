@@ -306,9 +306,12 @@ private:
     return fnv1a_64(v.data(), v.size());
   }
 
+public:
   void apply_put(std::string_view key, std::string_view json_body) {
     auto &s = get_shard(std::string(key));
     std::unique_lock lock(s.read_mu);
+
+     // std::fprintf(stderr, "[Store] apply_put: %.*s (body_len=%zu)\n", (int)key.size(), key.data(), json_body.size()); 
 
     uint64_t old_h = 0;
     auto it = s.map.find(std::string(key));
@@ -327,7 +330,7 @@ private:
     if (key.starts_with("sys:u:")) {
         try {
             uint32_t uid = std::stoul(std::string(key.substr(6)));
-            auto j = nlohmann::json::parse(json_body);
+            auto j = nlohmann::json::parse(std::string(json_body));
             credentials_->register_user(uid, j.value("name", ""), j.value("public_key", ""));
         } catch (...) {}
     } else if (key.starts_with("sys:acl:")) {
@@ -913,6 +916,22 @@ public:
       auto chunk = fut.get();
       results.insert(results.end(), chunk.begin(), chunk.end());
     }
+
+    if (results.empty()) {
+        for (size_t i = 0; i < SHARDS; ++i) {
+            auto &s = *shards_[i];
+            std::shared_lock lock(s.read_mu);
+            if (!s.map.empty()) {
+                 // std::fprintf(stderr, "[Store] Shard %zu sample keys: ", i);
+                int count = 0;
+                for (auto it = s.map.begin(); it != s.map.end() && count < 5; ++it, ++count) {
+                    std::fprintf(stderr, "[%s] ", it->first.c_str());
+                }
+                std::fprintf(stderr, "\n"); 
+            }
+        }
+    }
+
     return results;
   }
 };
