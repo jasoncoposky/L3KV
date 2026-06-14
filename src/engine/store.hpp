@@ -311,7 +311,7 @@ public:
     auto &s = get_shard(std::string(key));
     std::unique_lock lock(s.read_mu);
 
-     // std::fprintf(stderr, "[Store] apply_put: %.*s (body_len=%zu)\n", (int)key.size(), key.data(), json_body.size()); 
+     // if(0) std::fprintf(stderr, "[Store] apply_put: %.*s (body_len=%zu)\n", (int)key.size(), key.data(), json_body.size()); 
 
     uint64_t old_h = 0;
     auto it = s.map.find(std::string(key));
@@ -922,12 +922,12 @@ public:
             auto &s = *shards_[i];
             std::shared_lock lock(s.read_mu);
             if (!s.map.empty()) {
-                 // std::fprintf(stderr, "[Store] Shard %zu sample keys: ", i);
+                 // if(0) std::fprintf(stderr, "[Store] Shard %zu sample keys: ", i);
                 int count = 0;
                 for (auto it = s.map.begin(); it != s.map.end() && count < 5; ++it, ++count) {
-                    std::fprintf(stderr, "[%s] ", it->first.c_str());
+                    if(0) std::fprintf(stderr, "[%s] ", it->first.c_str());
                 }
-                std::fprintf(stderr, "\n"); 
+                if(0) std::fprintf(stderr, "\n"); 
             }
         }
     }
