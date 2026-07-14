@@ -308,6 +308,7 @@ private:
 
 public:
   void apply_put(std::string_view key, std::string_view json_body) {
+    if(1) std::fprintf(stderr, "[Store] apply_put: %.*s (len=%zu)\n", (int)key.size(), key.data(), json_body.size());
     auto &s = get_shard(std::string(key));
     std::unique_lock lock(s.read_mu);
 
@@ -583,7 +584,7 @@ public:
 
     wal_->append_batch(batch);
 
-    submit_async(key, [this, key = std::move(key), json_body = std::move(json_body), mkey_s = std::move(mkey_s), meta_val = std::move(meta_val)]() mutable {
+    submit_to_shard(key, [this, key = std::move(key), json_body = std::move(json_body), mkey_s = std::move(mkey_s), meta_val = std::move(meta_val)]() mutable {
       apply_put(key, json_body);
       apply_put(mkey_s, meta_val);
     });
@@ -606,7 +607,7 @@ public:
 
     wal_->append_batch(batch);
 
-    submit_async(key, [this, key = std::move(key), field = std::move(field), val, mkey_s = std::move(mkey_s), ts_str = std::move(ts_str)]() mutable {
+    submit_to_shard(key, [this, key = std::move(key), field = std::move(field), val, mkey_s = std::move(mkey_s), ts_str = std::move(ts_str)]() mutable {
       apply_patch_int(key, field, val);
       apply_patch_str(mkey_s, field, ts_str);
     });
@@ -629,7 +630,7 @@ public:
 
     wal_->append_batch(batch);
 
-    submit_async(key, [this, key = std::move(key), field = std::move(field), val = std::move(val), mkey_s = std::move(mkey_s), ts_str = std::move(ts_str)]() mutable {
+    submit_to_shard(key, [this, key = std::move(key), field = std::move(field), val = std::move(val), mkey_s = std::move(mkey_s), ts_str = std::move(ts_str)]() mutable {
       apply_patch_str(key, field, val);
       apply_patch_str(mkey_s, field, ts_str);
     });
@@ -840,7 +841,7 @@ public:
       return chunk;
 
     auto &s = *shards_[shard_idx];
-    return submit_to_shard_idx(shard_idx, [&, shard_idx]() {
+    return submit_to_shard_idx(shard_idx, [&, shard_idx, prefix, start_key]() {
       auto it = s.map.lower_bound(start_key);
       while (it != s.map.end() && it->first.starts_with(prefix)) {
         if (it->first > start_key ||
@@ -873,7 +874,7 @@ public:
       return chunk;
 
     auto &s = *shards_[shard_idx];
-    return submit_to_shard_idx(shard_idx, [&, shard_idx]() {
+    return submit_to_shard_idx(shard_idx, [&, shard_idx, prefix, start_key]() {
       auto it = s.map.lower_bound(start_key);
       while (it != s.map.end() && it->first.starts_with(prefix)) {
         if (it->first > start_key ||
