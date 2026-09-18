@@ -875,7 +875,9 @@ public:
 
     auto &s = *shards_[shard_idx];
     return submit_to_shard_idx(shard_idx, [&, shard_idx, prefix, start_key]() {
-      auto it = s.map.lower_bound(start_key);
+      std::string eff_start = start_key;
+      if (eff_start < prefix) eff_start = prefix;
+      auto it = s.map.lower_bound(eff_start);
       while (it != s.map.end() && it->first.starts_with(prefix)) {
         if (it->first > start_key ||
             (chunk.empty() && it->first >= start_key)) {
