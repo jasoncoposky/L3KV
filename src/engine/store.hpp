@@ -94,7 +94,7 @@ public:
       buffer.insert(buffer.end(), s.begin(), s.end());
     }
 
-    size_t dict_cap = 100 * 1024;
+    size_t dict_cap = std::min((size_t)(100 * 1024), std::max((size_t)256, buffer.size() / 10));
     std::vector<uint8_t> dict_buffer(dict_cap);
 
     size_t dict_size =
@@ -109,7 +109,7 @@ public:
 
     cdict_ = ZSTD_createCDict(dict_buffer.data(), dict_size, 3);
     ddict_ = ZSTD_createDDict(dict_buffer.data(), dict_size);
-    std::cout << "[ZstdManager] Dictionary trained on " << sizes.size()
+    std::cerr << "[ZstdManager] Dictionary trained on " << sizes.size()
               << " samples. Size: " << dict_size << " bytes.\n";
   }
 
@@ -308,7 +308,7 @@ private:
 
 public:
   void apply_put(std::string_view key, std::string_view json_body) {
-    if(1) std::fprintf(stderr, "[Store] apply_put: %.*s (len=%zu)\n", (int)key.size(), key.data(), json_body.size());
+    // if(0) std::fprintf(stderr, "[Store] apply_put: %.*s (len=%zu)\n", (int)key.size(), key.data(), json_body.size());
     auto &s = get_shard(std::string(key));
     std::unique_lock lock(s.read_mu);
 

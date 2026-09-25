@@ -210,6 +210,7 @@ public:
             if (posix_read != sizeof(h)) break;
             header_read = posix_read;
 #endif
+            if (current_offset + sizeof(h) + h.key_len + h.payload_len > fileSize64) break;
 
             std::string key(h.key_len, '\0');
             std::string payload(h.payload_len, '\0');
