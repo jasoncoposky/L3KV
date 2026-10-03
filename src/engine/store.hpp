@@ -158,8 +158,17 @@ public:
   uint32_t original_size_ = 0;
 
 public:
-  Blob(std::pmr::memory_resource *mr, size_t cap = 1024) : buf_(cap) {
-    buf_.init_object();
+  Blob() = default;
+
+  explicit Blob(std::pmr::memory_resource *mr, size_t cap = 0) : buf_(cap) {
+    if (cap > 0) {
+      buf_.init_object();
+    }
+  }
+
+  explicit Blob(std::string_view data, ZstdManager *zstd = nullptr,
+                std::pmr::memory_resource *mr = nullptr) {
+    overwrite(data, zstd);
   }
 
   void compress(ZstdManager *zstd) {
@@ -172,6 +181,7 @@ public:
       original_size_ = static_cast<uint32_t>(src.size());
       compressed_ = true;
       buf_ = lite3cpp::Buffer(std::vector<uint8_t>(dst.begin(), dst.end()));
+      buf_.shrink_to_fit();
     }
   }
 
@@ -183,24 +193,31 @@ public:
     zstd->decompress(src, dst, original_size_);
     compressed_ = false;
     buf_ = lite3cpp::Buffer(std::vector<uint8_t>(dst.begin(), dst.end()));
+    buf_.shrink_to_fit();
   }
 
-  void overwrite(const std::string &data, ZstdManager *zstd) {
+  void overwrite(std::string_view data, ZstdManager *zstd) {
     if (zstd && !zstd->is_active()) {
-      zstd->add_sample(data);
+      zstd->add_sample(std::string(data));
+    }
+
+    if (data.empty()) {
+      buf_ = lite3cpp::Buffer();
+      compressed_ = false;
+      original_size_ = 0;
+      return;
     }
 
     bool is_json = false;
-    if (!data.empty()) {
-      char first = data[0];
-      if (first == '{' || first == '[') {
-        is_json = true;
-      }
+    char first = data[0];
+    if (first == '{' || first == '[') {
+      is_json = true;
     }
 
     if (is_json) {
       try {
-        lite3cpp::Buffer new_buf = lite3cpp::lite3_json::from_json_string(data);
+        lite3cpp::Buffer new_buf = lite3cpp::lite3_json::from_json_string(std::string(data));
+        new_buf.shrink_to_fit();
         buf_ = std::move(new_buf);
         compressed_ = false;
         if (zstd)
@@ -213,6 +230,7 @@ public:
     // Treat as binary
     std::vector<uint8_t> vec(data.begin(), data.end());
     buf_ = lite3cpp::Buffer(std::move(vec));
+    buf_.shrink_to_fit();
     compressed_ = false;
     if (zstd)
       compress(zstd);
@@ -221,7 +239,11 @@ public:
   bool set_int(const std::string &key, int64_t val, ZstdManager *zstd) {
     if (compressed_)
       decompress(zstd);
+    if (buf_.size() == 0) {
+      buf_.init_object();
+    }
     buf_.set_i64(0, key, val);
+    buf_.shrink_to_fit();
     if (zstd)
       compress(zstd);
     return true;
@@ -231,7 +253,11 @@ public:
                ZstdManager *zstd) {
     if (compressed_)
       decompress(zstd);
+    if (buf_.size() == 0) {
+      buf_.init_object();
+    }
     buf_.set_str(0, key, val);
+    buf_.shrink_to_fit();
     if (zstd)
       compress(zstd);
     return true;
@@ -299,6 +325,11 @@ private:
     return {0, 0, 0};
   }
 
+  static std::shared_ptr<const Blob> get_empty_blob() {
+    static const auto empty = std::make_shared<Blob>();
+    return empty;
+  }
+
   uint64_t hash_blob(const std::shared_ptr<const Blob> &blob) {
     if (!blob)
       return 0;
@@ -320,8 +351,7 @@ public:
       old_h = hash_blob(it->second);
     }
 
-    auto new_blob = std::make_shared<Blob>(&s.pool);
-    new_blob->overwrite(std::string(json_body), zstd_manager_.get());
+    auto new_blob = std::make_shared<Blob>(json_body, zstd_manager_.get(), &s.pool);
     uint64_t new_h = hash_blob(new_blob);
     
     s.map[std::string(key)] = std::move(new_blob);
@@ -365,9 +395,13 @@ public:
     auto it = s.map.find(std::string(key));
     if (it != s.map.end()) {
       old_h = hash_blob(it->second);
-      new_blob = std::make_shared<Blob>(*it->second);
+      if (it->second && it->second->buf_.size() > 0) {
+        new_blob = std::make_shared<Blob>(*it->second);
+      } else {
+        new_blob = std::make_shared<Blob>(&s.pool, 0);
+      }
     } else {
-      new_blob = std::make_shared<Blob>(&s.pool);
+      new_blob = std::make_shared<Blob>(&s.pool, 0);
     }
 
     new_blob->set_int(std::string(field), val, zstd_manager_.get());
@@ -388,9 +422,13 @@ public:
     auto it = s.map.find(std::string(key));
     if (it != s.map.end()) {
       old_h = hash_blob(it->second);
-      new_blob = std::make_shared<Blob>(*it->second);
+      if (it->second && it->second->buf_.size() > 0) {
+        new_blob = std::make_shared<Blob>(*it->second);
+      } else {
+        new_blob = std::make_shared<Blob>(&s.pool, 0);
+      }
     } else {
-      new_blob = std::make_shared<Blob>(&s.pool);
+      new_blob = std::make_shared<Blob>(&s.pool, 0);
     }
 
     new_blob->set_str(std::string(field), std::string(val), zstd_manager_.get());
@@ -410,11 +448,10 @@ public:
         old_h = hash_blob(it->second);
     }
 
-    auto new_blob = std::make_shared<Blob>(&s.pool);
-    new_blob->overwrite("", zstd_manager_.get());
-    uint64_t new_h = hash_blob(new_blob);
+    auto empty_blob = get_empty_blob();
+    uint64_t new_h = hash_blob(empty_blob);
 
-    s.map[std::string(key)] = std::move(new_blob);
+    s.map[std::string(key)] = empty_blob;
     merkle_.apply_delta(std::string(key), old_h ^ new_h);
     return true;
   }

@@ -52,7 +52,9 @@ void ZmqServer::run() {
             // Check if identity is authenticated
             if (!session_identities_.contains(identity_str)) {
                 // Peek at opcode for AUTH
-                if (recv_msgs.size() >= 5 && *static_cast<char*>(recv_msgs[2].data()) == 'A') {
+                bool is_auth = (recv_msgs.size() >= 3 && recv_msgs[2].size() == 1 && *static_cast<char*>(recv_msgs[2].data()) == 'A') ||
+                               (recv_msgs.size() >= 4 && recv_msgs[3].size() == 1 && *static_cast<char*>(recv_msgs[3].data()) == 'A');
+                if (is_auth) {
                     // Handshake allowed without existing session
                 } else if (!server_secret_.empty()) {
                     std::cerr << "[ZmqServer] Rejected unauthenticated message from " << identity_str << std::endl;

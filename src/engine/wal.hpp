@@ -190,6 +190,9 @@ public:
     fileSize64 = st.st_size;
 #endif
 
+    std::fprintf(stderr, "[WAL RECOVER] Starting recovery. fileSize64 = %llu\n", (unsigned long long)fileSize64);
+    size_t recovered_ops = 0;
+
     if (fileSize64 > 0) {
         uint64_t current_offset = 0;
 #ifdef _WIN32
@@ -199,40 +202,60 @@ public:
 #endif
 
         while (current_offset < fileSize64) {
-            LogHeader h;
-            size_t header_read = 0;
 #ifdef _WIN32
+            LogHeader h;
             DWORD win_read = 0;
             if (!ReadFile(file_.h, &h, sizeof(h), &win_read, NULL) || win_read != sizeof(h)) break;
-            header_read = win_read;
-#else
-            ssize_t posix_read = read(file_.fd, &h, sizeof(h));
-            if (posix_read != sizeof(h)) break;
-            header_read = posix_read;
-#endif
             if (current_offset + sizeof(h) + h.key_len + h.payload_len > fileSize64) break;
+            std::string key(h.key_len, '\0');
+            std::string payload(h.payload_len, '\0');
+            if (h.key_len > 0) ReadFile(file_.h, key.data(), h.key_len, &win_read, NULL);
+            if (h.payload_len > 0) ReadFile(file_.h, payload.data(), h.payload_len, &win_read, NULL);
+            if (compute_crc(h.op, key, payload) != h.crc) break;
+            current_offset += sizeof(h) + h.key_len + h.payload_len;
+#else
+            LogHeader h;
+            if (current_offset + sizeof(h) > fileSize64) {
+                std::fprintf(stderr, "[WAL RECOVER] EOF at offset %llu (fileSize64=%llu)\n", (unsigned long long)current_offset, (unsigned long long)fileSize64);
+                break;
+            }
+            if (pread(file_.fd, &h, sizeof(h), current_offset) != sizeof(h)) {
+                std::fprintf(stderr, "[WAL RECOVER] Failed to pread header at offset %llu\n", (unsigned long long)current_offset);
+                break;
+            }
+
+            if (h.op == 0 && h.crc == 0 && h.key_len == 0 && h.payload_len == 0) {
+                std::fprintf(stderr, "[WAL RECOVER] Zero entry at offset %llu\n", (unsigned long long)current_offset);
+                break;
+            }
+
+            if (current_offset + sizeof(h) + h.key_len + h.payload_len > fileSize64) {
+                std::fprintf(stderr, "[WAL RECOVER] Oversize payload at offset %llu: klen=%u plen=%u fileSize=%llu\n", (unsigned long long)current_offset, h.key_len, h.payload_len, (unsigned long long)fileSize64);
+                break;
+            }
 
             std::string key(h.key_len, '\0');
             std::string payload(h.payload_len, '\0');
-            
             if (h.key_len > 0) {
-#ifdef _WIN32
-                ReadFile(file_.h, key.data(), h.key_len, &win_read, NULL);
-#else
-                read(file_.fd, key.data(), h.key_len);
-#endif
+                if (pread(file_.fd, key.data(), h.key_len, current_offset + sizeof(h)) != (ssize_t)h.key_len) {
+                    std::fprintf(stderr, "[WAL RECOVER] Failed to pread key at offset %llu\n", (unsigned long long)current_offset);
+                    break;
+                }
             }
             if (h.payload_len > 0) {
-#ifdef _WIN32
-                ReadFile(file_.h, payload.data(), h.payload_len, &win_read, NULL);
-#else
-                read(file_.fd, payload.data(), h.payload_len);
-#endif
+                if (pread(file_.fd, payload.data(), h.payload_len, current_offset + sizeof(h) + h.key_len) != (ssize_t)h.payload_len) {
+                    std::fprintf(stderr, "[WAL RECOVER] Failed to pread payload at offset %llu\n", (unsigned long long)current_offset);
+                    break;
+                }
             }
 
-            if (compute_crc(h.op, key, payload) != h.crc) break;
+            if (compute_crc(h.op, key, payload) != h.crc) {
+                std::fprintf(stderr, "[WAL RECOVER] CRC mismatch at offset %llu: expected=%08x\n", (unsigned long long)current_offset, h.crc);
+                break;
+            }
 
             current_offset += sizeof(h) + h.key_len + h.payload_len;
+#endif
 
             if ((WalOp)h.op == WalOp::BATCH) {
                 const uint8_t *p = (const uint8_t *)payload.data();
@@ -249,17 +272,24 @@ public:
                         if (p + b_vlen > end) break;
                         std::string_view b_val((const char *)p, b_vlen); p += b_vlen;
                         callback((WalOp)b_op, b_key, b_val);
+                        recovered_ops++;
                     }
                 }
             } else {
                 callback((WalOp)h.op, key, payload);
+                recovered_ops++;
             }
         }
+        std::fprintf(stderr, "[WAL RECOVER] Completed! Recovered %zu ops. Final offset: %llu / %llu\n", recovered_ops, (unsigned long long)current_offset, (unsigned long long)fileSize64);
 #ifdef _WIN32
-        LARGE_INTEGER li; li.QuadPart = 0;
-        SetFilePointerEx(file_.h, li, NULL, FILE_END);
+        LARGE_INTEGER li; li.QuadPart = current_offset;
+        SetFilePointerEx(file_.h, li, NULL, FILE_BEGIN);
+        SetEndOfFile(file_.h);
 #else
-        lseek(file_.fd, 0, SEEK_END);
+        if (current_offset < fileSize64) {
+            ftruncate(file_.fd, current_offset);
+        }
+        lseek(file_.fd, current_offset, SEEK_SET);
 #endif
     }
 
