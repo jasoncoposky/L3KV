@@ -19,7 +19,7 @@
 #include <shared_mutex>
 #include <vector>
 
-#include "../../lib/concurrentqueue/concurrentqueue.h"
+#include "../../lib/concurrentqueue/blockingconcurrentqueue.h"
 
 #include "buffer.hpp"
 #include "json.hpp"
@@ -258,7 +258,7 @@ class Engine {
     std::map<std::string, std::shared_ptr<const Blob>> map;
     
     // Message passing
-    moodycamel::ConcurrentQueue<CoreMessage> messages;
+    moodycamel::BlockingConcurrentQueue<CoreMessage> messages;
     std::atomic<bool> stop_flag{false};
     std::thread core_thread;
 
@@ -471,18 +471,11 @@ public:
 #endif
         auto &s = get_shard_by_index(i);
         CoreMessage msg;
-        int spin = 0;
         while (!s.stop_flag.load(std::memory_order_relaxed) ||
                s.messages.size_approx() > 0) {
-          if (s.messages.try_dequeue(msg)) {
-            spin = 0;
-            msg.task();
-          } else {
-            if (spin < 1000) {
-              spin++;
-            } else {
-              std::this_thread::sleep_for(std::chrono::microseconds(50));
-              spin = 0;
+          if (s.messages.wait_dequeue_timed(msg, std::chrono::milliseconds(50))) {
+            if (msg.task) {
+              msg.task();
             }
           }
         }
@@ -494,6 +487,7 @@ public:
   ~Engine() {
     for (size_t i = 0; i < SHARDS; ++i) {
       shards_[i]->stop_flag.store(true, std::memory_order_release);
+      shards_[i]->messages.enqueue({});
       if (shards_[i]->core_thread.joinable()) {
         shards_[i]->core_thread.join();
       }
@@ -844,6 +838,10 @@ public:
     return submit_to_shard_idx(shard_idx, [&, shard_idx, prefix, start_key]() {
       auto it = s.map.lower_bound(start_key);
       while (it != s.map.end() && it->first.starts_with(prefix)) {
+        if (it->first.ends_with(":meta")) {
+          ++it;
+          continue;
+        }
         if (it->first > start_key ||
             (chunk.empty() && it->first >= start_key)) {
           if (it->second->buf_.size() > 0) {
@@ -879,6 +877,10 @@ public:
       if (eff_start < prefix) eff_start = prefix;
       auto it = s.map.lower_bound(eff_start);
       while (it != s.map.end() && it->first.starts_with(prefix)) {
+        if (!it->second || it->second->buf_.size() == 0 || it->first.ends_with(":meta")) {
+          ++it;
+          continue;
+        }
         if (it->first > start_key ||
             (chunk.empty() && it->first >= start_key)) {
           chunk.push_back(it->first);
@@ -905,6 +907,10 @@ public:
         
         auto it = s.map.lower_bound(effective_start);
         while (it != s.map.end() && it->first.starts_with(prefix)) {
+          if (!it->second || it->second->buf_.size() == 0 || it->first.ends_with(":meta")) {
+            ++it;
+            continue;
+          }
           chunk.push_back(it->first);
           if (chunk.size() >= limit_per_shard)
             break;
