@@ -360,14 +360,21 @@ public:
     if (key.starts_with("sys:u:")) {
         try {
             uint32_t uid = std::stoul(std::string(key.substr(6)));
-            std::string uname = "";
-            std::string pubkey = "";
+            std::string uname;
+            std::string pubkey;
+            lite3cpp::Buffer buf;
             if (json_body.size() >= 4 && (static_cast<uint8_t>(json_body[0]) == 0x06 || static_cast<uint8_t>(json_body[0]) == 0x07)) {
-                lite3cpp::Buffer buf(std::vector<uint8_t>(json_body.begin(), json_body.end()));
+                buf = lite3cpp::Buffer(std::vector<uint8_t>(json_body.begin(), json_body.end()));
+            } else if (!json_body.empty() && (json_body[0] == '{' || json_body[0] == '[')) {
+                buf = lite3cpp::lite3_json::from_json_string(std::string(json_body));
+            }
+            if (buf.size() > 0) {
                 try { uname = std::string(buf.get_str(0, "name")); } catch (...) {}
                 try { pubkey = std::string(buf.get_str(0, "public_key")); } catch (...) {}
             }
-            credentials_->register_user(uid, uname, pubkey);
+            if (!uname.empty() || !pubkey.empty()) {
+                credentials_->register_user(uid, uname, pubkey);
+            }
         } catch (...) {}
     } else if (key.starts_with("sys:acl:")) {
         try {
@@ -685,10 +692,13 @@ public:
     auto now = clock_.now();
     std::string_view mkey_v = KeyBuilder::meta_key(key);
     std::string mkey_s(mkey_v);
-    std::string meta_val = "{\"ts\":" + std::to_string(now.wall_time) +
-                           ",\"l\":" + std::to_string(now.logical) +
-                           ",\"n\":" + std::to_string(now.node_id) +
-                           ",\"tombstone\":true}";
+    lite3cpp::Buffer mbuf;
+    mbuf.init_object();
+    mbuf.set_i64(0, "ts", now.wall_time);
+    mbuf.set_i64(0, "l", now.logical);
+    mbuf.set_i64(0, "n", now.node_id);
+    mbuf.set_bool(0, "tombstone", true);
+    std::string meta_val = mbuf.move_to_string();
 
     std::vector<BatchOp> batch;
     batch.push_back({WalOp::DELETE_, key, ""});
@@ -733,9 +743,12 @@ public:
 
       auto now = clock_.now();
       std::string mkey_s(KeyBuilder::meta_key(key));
-      std::string meta_val = "{\"ts\":" + std::to_string(now.wall_time) +
-                             ",\"l\":" + std::to_string(now.logical) +
-                             ",\"n\":" + std::to_string(now.node_id) + "}";
+      lite3cpp::Buffer mbuf;
+      mbuf.init_object();
+      mbuf.set_i64(0, "ts", now.wall_time);
+      mbuf.set_i64(0, "l", now.logical);
+      mbuf.set_i64(0, "n", now.node_id);
+      std::string meta_val = mbuf.move_to_string();
 
       wal_batch.push_back({WalOp::PUT, key, val});
       wal_batch.push_back({WalOp::PUT, mkey_s, meta_val});
@@ -807,10 +820,15 @@ public:
       return;
     }
 
-    std::string meta_val = "{\"ts\":" + std::to_string(m.timestamp.wall_time) +
-                           ",\"l\":" + std::to_string(m.timestamp.logical) +
-                           ",\"n\":" + std::to_string(m.timestamp.node_id) +
-                           (m.is_delete ? ",\"tombstone\":true" : "") + "}";
+    lite3cpp::Buffer mbuf;
+    mbuf.init_object();
+    mbuf.set_i64(0, "ts", m.timestamp.wall_time);
+    mbuf.set_i64(0, "l", m.timestamp.logical);
+    mbuf.set_i64(0, "n", m.timestamp.node_id);
+    if (m.is_delete) {
+        mbuf.set_bool(0, "tombstone", true);
+    }
+    std::string meta_val = mbuf.move_to_string();
 
     std::vector<BatchOp> wal_batch;
     if (m.is_delete) {

@@ -45,6 +45,13 @@ void test_sidecar_metadata() {
         std::cerr << "FAIL: Sidecar metadata test - doc not found" << std::endl;
         exit(1);
     }
+
+    auto meta = db.get("doc1:meta");
+    if (meta.size() == 0 || meta.get_i64(0, "ts") <= 0) {
+        std::cerr << "FAIL: Sidecar metadata ts missing or <= 0" << std::endl;
+        exit(1);
+    }
+    assert(meta.get_i64(0, "ts") > 0);
   }
   std::filesystem::remove(path);
   std::cout << "[PASS] Sidecar Metadata (Verified)" << std::endl;
@@ -189,6 +196,30 @@ void test_tombstones() {
   std::filesystem::remove(path);
 }
 
+void test_user_credentials() {
+  std::cout << "TEST: User Credentials Registration..." << std::endl;
+  std::string path = "test_creds.wal";
+  std::filesystem::remove(path);
+
+  {
+    Engine db(path, 1);
+    db.put("sys:u:101", R"({"name":"alice","public_key":"key1"})");
+    db.wait_all_shards();
+
+    auto user = db.credentials().get_user_by_key("key1");
+    if (!user.has_value()) {
+        std::cerr << "FAIL: User credential not found by key" << std::endl;
+        exit(1);
+    }
+    assert(user.has_value());
+    assert(user->uid == 101);
+    assert(user->name == "alice");
+    assert(user->public_key == "key1");
+    std::cout << "[PASS] User Credentials Registration" << std::endl;
+  }
+  std::filesystem::remove(path);
+}
+
 int main() {
   try {
     test_manual_buffer();
@@ -198,6 +229,7 @@ int main() {
     test_conflict_resolution();
     test_tombstones();
     test_merkle_recovery();
+    test_user_credentials();
     std::cout << "All Store Tests Passed Deterministically!" << std::endl;
   } catch (const std::exception &e) {
     std::cerr << "Test Exception: " << e.what() << std::endl;
