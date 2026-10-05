@@ -149,6 +149,12 @@ public:
   }
 };
 
+static inline bool is_json_payload(std::string_view data) {
+    size_t first_non_ws = data.find_first_not_of(" \t\r\n");
+    return (first_non_ws != std::string_view::npos &&
+            (data[first_non_ws] == '{' || data[first_non_ws] == '['));
+}
+
 // A wrapper around a single Lite3 buffer using PMR
 class Blob {
 public:
@@ -207,11 +213,7 @@ public:
       return;
     }
 
-    bool is_json = false;
-    char first = data[0];
-    if (first == '{' || first == '[') {
-      is_json = true;
-    }
+    bool is_json = is_json_payload(data);
 
     if (is_json) {
       try {
@@ -363,11 +365,9 @@ public:
             std::string uname;
             std::string pubkey;
             lite3cpp::Buffer buf;
-            size_t first_non_ws = json_body.find_first_not_of(" \t\r\n");
             if (json_body.size() >= 4 && (static_cast<uint8_t>(json_body[0]) == 0x06 || static_cast<uint8_t>(json_body[0]) == 0x07)) {
                 buf = lite3cpp::Buffer(std::vector<uint8_t>(json_body.begin(), json_body.end()));
-            } else if (first_non_ws != std::string_view::npos && 
-                       (json_body[first_non_ws] == '{' || json_body[first_non_ws] == '[')) {
+            } else if (is_json_payload(json_body)) {
                 buf = lite3cpp::lite3_json::from_json_string(std::string(json_body));
             }
             if (buf.size() > 0) {

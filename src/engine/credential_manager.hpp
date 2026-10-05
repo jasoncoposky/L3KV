@@ -64,6 +64,7 @@ public:
     }
 
     std::optional<UserIdentity> get_user_by_key(const std::string& public_key) const {
+        if (public_key.empty()) return std::nullopt;
         std::shared_lock lock(mutex_);
         auto it = key_to_uid_.find(public_key);
         if (it == key_to_uid_.end()) return std::nullopt;

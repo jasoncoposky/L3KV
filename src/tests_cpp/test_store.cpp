@@ -236,6 +236,10 @@ void test_user_credentials() {
 
     assert(!db.credentials().get_user_by_key("").has_value());
 
+    db.put("sys:u:104", "  \n\t{\"name\":\"charlie\",\"public_key\":\"key4\"}");
+    db.wait_all_shards();
+    assert(db.credentials().get_user_by_key("key4") == 104);
+
     std::cout << "[PASS] User Credentials Registration" << std::endl;
   }
   std::filesystem::remove(path);
