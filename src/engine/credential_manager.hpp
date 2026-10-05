@@ -87,7 +87,7 @@ public:
         });
     }
 
-    Permission check_permission(uint32_t uid, const std::string& key) const {
+    Permission check_permission(uint32_t uid, std::string_view key) const {
         if (uid == INTERNAL_UID || uid == ADMIN_UID) return Permission::ADMIN;
         
         std::shared_lock lock(mutex_);

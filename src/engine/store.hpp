@@ -185,7 +185,7 @@ public:
     if (dst.size() < src.size()) {
       original_size_ = static_cast<uint32_t>(src.size());
       compressed_ = true;
-      buf_ = lite3cpp::Buffer(std::vector<uint8_t>(dst.begin(), dst.end()));
+      buf_ = lite3cpp::Buffer(reinterpret_cast<const uint8_t*>(dst.data()), dst.size());
       buf_.shrink_to_fit();
     }
   }
@@ -197,7 +197,7 @@ public:
     std::string dst;
     zstd->decompress(src, dst, original_size_);
     compressed_ = false;
-    buf_ = lite3cpp::Buffer(std::vector<uint8_t>(dst.begin(), dst.end()));
+    buf_ = lite3cpp::Buffer(reinterpret_cast<const uint8_t*>(dst.data()), dst.size());
     buf_.shrink_to_fit();
   }
 
@@ -229,8 +229,7 @@ public:
     }
 
     // Treat as binary
-    std::vector<uint8_t> vec(data.begin(), data.end());
-    buf_ = lite3cpp::Buffer(std::move(vec));
+    buf_ = lite3cpp::Buffer(reinterpret_cast<const uint8_t*>(data.data()), data.size());
     buf_.shrink_to_fit();
     compressed_ = false;
     if (zstd)
@@ -282,7 +281,7 @@ class Engine {
 
   struct alignas(64) Shard {
     std::pmr::unsynchronized_pool_resource pool;
-    std::map<std::string, std::shared_ptr<const Blob>> map;
+    std::map<std::string, std::shared_ptr<const Blob>, std::less<>> map;
     
     // Message passing
     moodycamel::BlockingConcurrentQueue<CoreMessage> messages;
@@ -304,11 +303,11 @@ class Engine {
 public:
   CredentialManager& credentials() { return *credentials_; }
 
-  size_t get_routing_shard(const std::string &key) {
+  size_t get_routing_shard(std::string_view key) {
     size_t start = key.find('{');
-    if (start != std::string::npos) {
+    if (start != std::string_view::npos) {
       size_t end = key.find('}', start + 1);
-      if (end != std::string::npos) {
+      if (end != std::string_view::npos) {
         std::string_view tag(key.data() + start + 1, end - start - 1);
         return XXH3_64bits(tag.data(), tag.size()) % SHARDS;
       }
@@ -317,7 +316,7 @@ public:
   }
 
 private:
-  Shard &get_shard(const std::string &key) {
+  Shard &get_shard(std::string_view key) {
     return *shards_[get_routing_shard(key)];
   }
 
@@ -341,13 +340,13 @@ private:
 public:
   void apply_put(std::string_view key, std::string_view json_body) {
     // if(0) std::fprintf(stderr, "[Store] apply_put: %.*s (len=%zu)\n", (int)key.size(), key.data(), json_body.size());
-    auto &s = get_shard(std::string(key));
+    auto &s = get_shard(key);
     std::unique_lock lock(s.read_mu);
 
      // if(0) std::fprintf(stderr, "[Store] apply_put: %.*s (body_len=%zu)\n", (int)key.size(), key.data(), json_body.size()); 
 
     uint64_t old_h = 0;
-    auto it = s.map.find(std::string(key));
+    auto it = s.map.find(key);
     if (it != s.map.end()) {
       old_h = hash_blob(it->second);
     }
@@ -400,13 +399,13 @@ public:
 
   void apply_patch_int(std::string_view key, std::string_view field,
                        int64_t val) {
-    auto &s = get_shard(std::string(key));
+    auto &s = get_shard(key);
     std::unique_lock lock(s.read_mu);
     
     uint64_t old_h = 0;
     std::shared_ptr<Blob> new_blob;
     
-    auto it = s.map.find(std::string(key));
+    auto it = s.map.find(key);
     if (it != s.map.end()) {
       old_h = hash_blob(it->second);
       if (it->second && it->second->buf_.size() > 0) {
@@ -427,13 +426,13 @@ public:
 
   void apply_patch_str(std::string_view key, std::string_view field,
                        std::string_view val) {
-    auto &s = get_shard(std::string(key));
+    auto &s = get_shard(key);
     std::unique_lock lock(s.read_mu);
     
     uint64_t old_h = 0;
     std::shared_ptr<Blob> new_blob;
     
-    auto it = s.map.find(std::string(key));
+    auto it = s.map.find(key);
     if (it != s.map.end()) {
       old_h = hash_blob(it->second);
       if (it->second && it->second->buf_.size() > 0) {
@@ -453,11 +452,11 @@ public:
   }
 
   bool apply_del(std::string_view key) {
-    auto &s = get_shard(std::string(key));
+    auto &s = get_shard(key);
     std::unique_lock lock(s.read_mu);
 
     uint64_t old_h = 0;
-    auto it = s.map.find(std::string(key));
+    auto it = s.map.find(key);
     if (it != s.map.end()) {
         old_h = hash_blob(it->second);
     }
@@ -582,7 +581,7 @@ public:
     return submit_to_shard_idx(h, std::forward<Func>(f)).get();
   }
 
-  std::shared_ptr<const Blob> get_view(const std::string &key) {
+  std::shared_ptr<const Blob> get_view(std::string_view key) {
     size_t h = get_routing_shard(key);
     auto &s = *shards_[h];
     std::shared_ptr<const Blob> result;
@@ -596,7 +595,7 @@ public:
     return result;
   }
 
-  lite3cpp::Buffer get(const std::string &key, uint32_t principal_id = ADMIN_UID) {
+  lite3cpp::Buffer get(std::string_view key, uint32_t principal_id = ADMIN_UID) {
     // Foundational Security: ACL Check
     auto perm = credentials_->check_permission(principal_id, key);
     if (!(perm & Permission::READ) && !(perm & Permission::ADMIN)) {
@@ -610,7 +609,7 @@ public:
         std::string src(reinterpret_cast<const char *>(view->buf_.data()), view->buf_.size());
         std::string dst;
         zstd_manager_->decompress(src, dst, view->original_size_);
-        return lite3cpp::Buffer(std::vector<uint8_t>(dst.begin(), dst.end()));
+        return lite3cpp::Buffer(reinterpret_cast<const uint8_t*>(dst.data()), dst.size());
     }
     return view->buf_;
   }
