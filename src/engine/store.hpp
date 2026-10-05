@@ -302,6 +302,7 @@ class Engine {
 
 public:
   CredentialManager& credentials() { return *credentials_; }
+  HybridLogicalClock& get_clock() { return clock_; }
 
   size_t get_routing_shard(std::string_view key) {
     size_t start = key.find('{');
@@ -803,6 +804,35 @@ public:
       }
     }
     return res;
+  }
+
+  struct ShardMutation {
+    std::vector<std::pair<std::string, std::string>> puts;
+    std::vector<std::string> dels;
+  };
+
+  void apply_batch_mutations(const std::vector<BatchOp>& wal_ops,
+                             std::map<size_t, ShardMutation> shard_mutations) {
+    if (wal_ops.empty() && shard_mutations.empty()) return;
+
+    if (!wal_ops.empty() && wal_) {
+      wal_->append_batch(wal_ops);
+    }
+
+    std::vector<std::future<void>> futures;
+    for (auto &[shard_idx, mut] : shard_mutations) {
+      futures.push_back(submit_to_shard_idx(shard_idx, [this, puts = std::move(mut.puts), dels = std::move(mut.dels)]() mutable {
+        for (auto &d : dels) {
+          apply_del(d);
+        }
+        for (auto &p : puts) {
+          apply_put(p.first, p.second);
+        }
+      }));
+    }
+    for (auto &fut : futures) {
+      fut.get();
+    }
   }
 
   inline void apply_mutation(const Mutation &m) {
