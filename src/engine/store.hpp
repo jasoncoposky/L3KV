@@ -526,7 +526,9 @@ public:
                s.messages.size_approx() > 0) {
           if (s.messages.wait_dequeue_timed(msg, std::chrono::milliseconds(50))) {
             if (msg.task) {
-              msg.task();
+              try {
+                msg.task();
+              } catch (...) {}
             }
           }
         }
@@ -555,11 +557,15 @@ public:
     auto fut = p->get_future();
 
     s.messages.enqueue({[p, f = std::forward<Func>(f)]() mutable {
-      if constexpr (std::is_void_v<ReturnType>) {
-        f();
-        p->set_value();
-      } else {
-        p->set_value(f());
+      try {
+        if constexpr (std::is_void_v<ReturnType>) {
+          f();
+          p->set_value();
+        } else {
+          p->set_value(f());
+        }
+      } catch (...) {
+        p->set_exception(std::current_exception());
       }
     }});
     return fut;
@@ -901,6 +907,7 @@ public:
 
     auto do_scan = [&, shard_idx, prefix, start_key]() {
       auto &s = *shards_[shard_idx];
+      std::shared_lock lock(s.read_mu);
       std::string eff_start = start_key;
       if (eff_start < prefix) eff_start = prefix;
       auto it = s.map.lower_bound(eff_start);
@@ -964,6 +971,7 @@ public:
 
     auto &s = *shards_[shard_idx];
     return submit_to_shard_idx(shard_idx, [&, shard_idx, prefix, start_key]() {
+      std::shared_lock lock(s.read_mu);
       std::string eff_start = start_key;
       if (eff_start < prefix) eff_start = prefix;
       auto it = s.map.lower_bound(eff_start);
