@@ -52,6 +52,12 @@ void test_sidecar_metadata() {
         exit(1);
     }
     assert(meta.get_i64(0, "ts") > 0);
+
+    db.del("doc1");
+    db.wait_all_shards();
+    auto del_meta = db.get("doc1:meta");
+    assert(del_meta.size() > 0);
+    assert(del_meta.get_bool(0, "tombstone") == true);
   }
   std::filesystem::remove(path);
   std::cout << "[PASS] Sidecar Metadata (Verified)" << std::endl;
@@ -215,6 +221,21 @@ void test_user_credentials() {
     assert(user->uid == 101);
     assert(user->name == "alice");
     assert(user->public_key == "key1");
+
+    lite3cpp::Buffer buf;
+    buf.init_object();
+    buf.set_str(0, "name", "bob");
+    buf.set_str(0, "public_key", "key2");
+    db.put("sys:u:102", buf.move_to_string());
+    db.wait_all_shards();
+
+    assert(db.credentials().get_user_by_key("key2") == 102);
+
+    db.put("sys:u:103", "{}");
+    db.wait_all_shards();
+
+    assert(!db.credentials().get_user_by_key("").has_value());
+
     std::cout << "[PASS] User Credentials Registration" << std::endl;
   }
   std::filesystem::remove(path);

@@ -363,16 +363,18 @@ public:
             std::string uname;
             std::string pubkey;
             lite3cpp::Buffer buf;
+            size_t first_non_ws = json_body.find_first_not_of(" \t\r\n");
             if (json_body.size() >= 4 && (static_cast<uint8_t>(json_body[0]) == 0x06 || static_cast<uint8_t>(json_body[0]) == 0x07)) {
                 buf = lite3cpp::Buffer(std::vector<uint8_t>(json_body.begin(), json_body.end()));
-            } else if (!json_body.empty() && (json_body[0] == '{' || json_body[0] == '[')) {
+            } else if (first_non_ws != std::string_view::npos && 
+                       (json_body[first_non_ws] == '{' || json_body[first_non_ws] == '[')) {
                 buf = lite3cpp::lite3_json::from_json_string(std::string(json_body));
             }
             if (buf.size() > 0) {
                 try { uname = std::string(buf.get_str(0, "name")); } catch (...) {}
                 try { pubkey = std::string(buf.get_str(0, "public_key")); } catch (...) {}
             }
-            if (!uname.empty() || !pubkey.empty()) {
+            if (!uname.empty() && !pubkey.empty()) {
                 credentials_->register_user(uid, uname, pubkey);
             }
         } catch (...) {}

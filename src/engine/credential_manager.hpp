@@ -34,7 +34,18 @@ struct UserIdentity {
     uint32_t uid;
     std::string name;
     std::string public_key;
+
+    bool operator==(const UserIdentity& other) const = default;
+    bool operator==(uint32_t id) const { return uid == id; }
+    friend bool operator==(uint32_t id, const UserIdentity& u) { return u.uid == id; }
 };
+
+inline bool operator==(const std::optional<UserIdentity>& opt, uint32_t id) {
+    return opt.has_value() && opt->uid == id;
+}
+inline bool operator==(uint32_t id, const std::optional<UserIdentity>& opt) {
+    return opt.has_value() && opt->uid == id;
+}
 
 class CredentialManager {
 public:
@@ -46,7 +57,9 @@ public:
         
         UserIdentity user{uid, name, public_key};
         users_[uid] = user;
-        key_to_uid_[public_key] = uid;
+        if (!public_key.empty()) {
+            key_to_uid_[public_key] = uid;
+        }
         return true;
     }
 
