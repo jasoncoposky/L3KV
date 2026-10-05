@@ -5,7 +5,6 @@
 #include "wal.hpp"
 #include "KeyBuilder.hpp"
 #include "credential_manager.hpp"
-#include <nlohmann/json.hpp>
 
 #include <functional>
 #include <iostream>
@@ -361,8 +360,14 @@ public:
     if (key.starts_with("sys:u:")) {
         try {
             uint32_t uid = std::stoul(std::string(key.substr(6)));
-            auto j = nlohmann::json::parse(std::string(json_body));
-            credentials_->register_user(uid, j.value("name", ""), j.value("public_key", ""));
+            std::string uname = "";
+            std::string pubkey = "";
+            if (json_body.size() >= 4 && (static_cast<uint8_t>(json_body[0]) == 0x06 || static_cast<uint8_t>(json_body[0]) == 0x07)) {
+                lite3cpp::Buffer buf(std::vector<uint8_t>(json_body.begin(), json_body.end()));
+                try { uname = std::string(buf.get_str(0, "name")); } catch (...) {}
+                try { pubkey = std::string(buf.get_str(0, "public_key")); } catch (...) {}
+            }
+            credentials_->register_user(uid, uname, pubkey);
         } catch (...) {}
     } else if (key.starts_with("sys:acl:")) {
         try {
@@ -605,9 +610,12 @@ public:
     auto now = clock_.now();
     std::string_view mkey_v = KeyBuilder::meta_key(key);
     std::string mkey_s(mkey_v);
-    std::string meta_val = "{\"ts\":" + std::to_string(now.wall_time) +
-                           ",\"l\":" + std::to_string(now.logical) +
-                           ",\"n\":" + std::to_string(now.node_id) + "}";
+    lite3cpp::Buffer mbuf;
+    mbuf.init_object();
+    mbuf.set_i64(0, "ts", now.wall_time);
+    mbuf.set_i64(0, "l", now.logical);
+    mbuf.set_i64(0, "n", now.node_id);
+    std::string meta_val = mbuf.move_to_string();
 
     std::vector<BatchOp> batch;
     batch.push_back({WalOp::PUT, key, json_body});
