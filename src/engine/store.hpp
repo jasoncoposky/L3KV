@@ -899,9 +899,11 @@ public:
     if (shard_idx >= SHARDS)
       return chunk;
 
-    auto &s = *shards_[shard_idx];
-    return submit_to_shard_idx(shard_idx, [&, shard_idx, prefix, start_key]() {
-      auto it = s.map.lower_bound(start_key);
+    auto do_scan = [&, shard_idx, prefix, start_key]() {
+      auto &s = *shards_[shard_idx];
+      std::string eff_start = start_key;
+      if (eff_start < prefix) eff_start = prefix;
+      auto it = s.map.lower_bound(eff_start);
       while (it != s.map.end() && it->first.starts_with(prefix)) {
         if (it->first.ends_with(":meta")) {
           ++it;
@@ -909,7 +911,7 @@ public:
         }
         if (it->first > start_key ||
             (chunk.empty() && it->first >= start_key)) {
-          if (it->second->buf_.size() > 0) {
+          if (it->second && it->second->buf_.size() > 0) {
             std::string vstr;
             if (it->second->compressed_) {
               std::string src(reinterpret_cast<const char *>(it->second->buf_.data()), it->second->buf_.size());
@@ -925,7 +927,31 @@ public:
         ++it;
       }
       return chunk;
-    }).get();
+    };
+
+    if (std::this_thread::get_id() == shards_[shard_idx]->core_thread.get_id()) {
+      return do_scan();
+    } else {
+      return submit_to_shard_idx(shard_idx, do_scan).get();
+    }
+  }
+
+  std::vector<std::pair<std::string, std::string>>
+  get_prefix_entries_all_shards(const std::string &prefix,
+                                const std::string &start_key = "",
+                                size_t limit_per_shard = 100000) {
+    std::vector<std::future<std::vector<std::pair<std::string, std::string>>>> futures;
+    for (size_t i = 0; i < SHARDS; ++i) {
+      futures.push_back(submit_to_shard_idx(i, [this, i, prefix, start_key, limit_per_shard]() {
+        return get_prefix_chunk(prefix, i, start_key, limit_per_shard);
+      }));
+    }
+    std::vector<std::pair<std::string, std::string>> results;
+    for (auto &fut : futures) {
+      auto chunk = fut.get();
+      results.insert(results.end(), chunk.begin(), chunk.end());
+    }
+    return results;
   }
 
   std::vector<std::string> get_prefix_keys(const std::string &prefix,
