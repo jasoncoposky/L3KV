@@ -38,7 +38,13 @@ FetchContent_Declare(
 )
 set(XXHASH_BUILD_ALIASES ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(xxhash)
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/_deps/xxhash-src)
+FetchContent_Declare(
+  concurrentqueue
+  GIT_REPOSITORY https://github.com/cameron314/concurrentqueue.git
+  GIT_TAG        master
+)
+FetchContent_MakeAvailable(concurrentqueue)
+include_directories(${concurrentqueue_SOURCE_DIR})
 
 # ZeroMQ & cppzmq
 find_package(PkgConfig REQUIRED)
@@ -78,6 +84,7 @@ add_library(l3kv_engine STATIC
 target_include_directories(l3kv_engine PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../lib/lite3-cpp/include
+    ${concurrentqueue_SOURCE_DIR}
     "${CMAKE_CURRENT_SOURCE_DIR}/../lib/boost_1_89_0"
     ${CMAKE_CURRENT_SOURCE_DIR}/_deps/zstd-src/lib
 )
