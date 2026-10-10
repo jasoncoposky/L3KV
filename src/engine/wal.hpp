@@ -1,6 +1,4 @@
 #pragma once
-#include "libconveyor/conveyor_modern.hpp"
-#include "wal_storage.hpp"
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -35,6 +33,12 @@ struct BatchOp {
   std::string_view value;
 };
 
+struct WalStats {
+  size_t bytes_written{0};
+  size_t bytes_read{0};
+  int last_error_code{0};
+};
+
 #pragma pack(push, 1)
 struct LogHeader {
   uint32_t crc;
@@ -47,12 +51,12 @@ struct LogHeader {
 class WriteAheadLog {
   struct FileHandle {
 #ifdef _WIN32
-    HANDLE h;
+    HANDLE h{INVALID_HANDLE_VALUE};
 #else
-    int fd;
+    int fd{-1};
 #endif
 
-    FileHandle(const std::string &p) {
+    explicit FileHandle(const std::string &p) {
 #ifdef _WIN32
       h = CreateFileA(p.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
                       NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -78,19 +82,14 @@ class WriteAheadLog {
         close(fd);
 #endif
     }
-
-    storage_handle_t get() const {
-#ifdef _WIN32
-      return (storage_handle_t)h;
-#else
-      return (storage_handle_t)(intptr_t)fd;
-#endif
-    }
   };
 
   std::string path_;
   FileHandle file_;
-  std::unique_ptr<libconveyor::v2::Conveyor> wal_;
+  mutable std::mutex write_mutex_;
+  std::atomic<size_t> bytes_written_{0};
+  std::atomic<size_t> bytes_read_{0};
+  std::atomic<int> last_error_code_{0};
 
   static uint32_t compute_crc(uint8_t op, std::string_view key,
                                std::string_view payload) {
@@ -109,17 +108,48 @@ class WriteAheadLog {
     return ~crc;
   }
 
+  bool write_raw(const void* data, size_t len) {
+    if (!data || len == 0) return true;
+    std::lock_guard<std::mutex> lock(write_mutex_);
+#ifdef _WIN32
+    DWORD written = 0;
+    if (!WriteFile(file_.h, data, static_cast<DWORD>(len), &written, NULL) || written != len) {
+      last_error_code_.store(static_cast<int>(GetLastError()), std::memory_order_relaxed);
+      return false;
+    }
+#else
+    const char* ptr = static_cast<const char*>(data);
+    size_t remaining = len;
+    while (remaining > 0) {
+      ssize_t n = write(file_.fd, ptr, remaining);
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        last_error_code_.store(errno, std::memory_order_relaxed);
+        return false;
+      }
+      ptr += n;
+      remaining -= static_cast<size_t>(n);
+    }
+#endif
+    bytes_written_.fetch_add(len, std::memory_order_relaxed);
+    return true;
+  }
+
 public:
   explicit WriteAheadLog(std::string path)
-      : path_(std::move(path)), file_(path_) {}
+      : path_(std::move(path)), file_(path_) {
+#ifdef _WIN32
+    SetFilePointer(file_.h, 0, NULL, FILE_END);
+#else
+    lseek(file_.fd, 0, SEEK_END);
+#endif
+  }
 
   ~WriteAheadLog() {
-      if (wal_) wal_->flush();
+    flush();
   }
 
   void append(WalOp op, std::string_view key, std::string_view payload) {
-    if (!wal_) return;
-    
     uint32_t crc = compute_crc((uint8_t)op, key, payload);
     size_t total_len = sizeof(LogHeader) + key.size() + payload.size();
 
@@ -135,11 +165,11 @@ public:
     
     std::memcpy(ptr, payload.data(), payload.size());
     
-    wal_->write(buffer);
+    write_raw(buffer.data(), buffer.size());
   }
 
   void append_batch(const std::vector<BatchOp> &ops) {
-    if (ops.empty() || !wal_) return;
+    if (ops.empty()) return;
 
     size_t payload_size = 4; // count
     for (const auto &op : ops) {
@@ -172,7 +202,7 @@ public:
     LogHeader h{crc, (uint8_t)WalOp::BATCH, 0, (uint32_t)payload_size};
     std::memcpy(ptr, &h, sizeof(h));
 
-    wal_->write(buffer);
+    write_raw(buffer.data(), buffer.size());
   }
 
   using RecoverCallback =
@@ -287,31 +317,28 @@ public:
         SetEndOfFile(file_.h);
 #else
         if (current_offset < fileSize64) {
-            ftruncate(file_.fd, current_offset);
+            (void)ftruncate(file_.fd, current_offset);
         }
         lseek(file_.fd, current_offset, SEEK_SET);
 #endif
-    }
-
-    libconveyor::v2::Config cfg;
-    cfg.handle = file_.get();
-#ifdef _WIN32
-    cfg.ops = wal::WindowsStorage::get_ops();
-#else
-    cfg.ops = wal::POSIXStorage::get_ops();
-#endif
-    cfg.write_capacity = 20 * 1024 * 1024;
-    cfg.read_capacity = 5 * 1024 * 1024;
-
-    auto create_res = libconveyor::v2::Conveyor::create(cfg);
-    if (create_res) {
-        wal_ = std::make_unique<libconveyor::v2::Conveyor>(std::move(create_res.value()));
-        wal_->seek(0, SEEK_END);
+        bytes_read_.store(current_offset, std::memory_order_relaxed);
     }
   }
 
-  void flush() { if (wal_) wal_->flush(); }
-  auto stats() { return wal_ ? wal_->stats() : libconveyor::v2::Conveyor::Stats{}; }
+  void flush() {
+    std::lock_guard<std::mutex> lock(write_mutex_);
+#ifdef _WIN32
+    FlushFileBuffers(file_.h);
+#else
+    fdatasync(file_.fd);
+#endif
+  }
+
+  WalStats stats() const {
+    return WalStats{bytes_written_.load(std::memory_order_relaxed),
+                    bytes_read_.load(std::memory_order_relaxed),
+                    last_error_code_.load(std::memory_order_relaxed)};
+  }
 };
 
 } // namespace l3kv

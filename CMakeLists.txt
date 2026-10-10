@@ -14,8 +14,6 @@ if(LITE3CPP_DISABLE_OBSERVABILITY)
 endif()
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../lib/lite3-cpp ${CMAKE_CURRENT_BINARY_DIR}/lite3-cpp)
 
-set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../libconveyor ${CMAKE_CURRENT_BINARY_DIR}/libconveyor)
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../lib/liblite3client ${CMAKE_CURRENT_BINARY_DIR}/liblite3client)
 
@@ -80,13 +78,11 @@ add_library(l3kv_engine STATIC
 target_include_directories(l3kv_engine PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../lib/lite3-cpp/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../libconveyor/include
     "${CMAKE_CURRENT_SOURCE_DIR}/../lib/boost_1_89_0"
     ${CMAKE_CURRENT_SOURCE_DIR}/_deps/zstd-src/lib
 )
 target_link_libraries(l3kv_engine PUBLIC
     lite3-cpp
-    conveyor
     libzstd_static
     xxhash
 )
@@ -102,7 +98,6 @@ add_executable(l3svc
 target_include_directories(l3svc PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../lib/lite3-cpp/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../libconveyor/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../lib/liblite3client/external
     "${CMAKE_CURRENT_SOURCE_DIR}/../lib/boost_1_89_0"
 )
@@ -113,7 +108,6 @@ target_link_libraries(l3svc PRIVATE
     $<$<BOOL:${WIN32}>:bcrypt>
     $<$<BOOL:${WIN32}>:iphlpapi>
     lite3-cpp
-    conveyor
     libzstd_static
     xxhash
     l3kv_engine
@@ -196,7 +190,6 @@ target_include_directories(test_sync_simulation PRIVATE
 target_link_libraries(test_sync_simulation PRIVATE
     Threads::Threads
     $<$<BOOL:${WIN32}>:ws2_32>
-    conveyor
     lite3-cpp
     l3kv_engine
 )
@@ -209,7 +202,6 @@ target_include_directories(test_sync_latency PRIVATE
 target_link_libraries(test_sync_latency PRIVATE
     Threads::Threads
     $<$<BOOL:${WIN32}>:ws2_32>
-    conveyor
     lite3-cpp
     l3kv_engine
 )
