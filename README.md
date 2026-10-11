@@ -14,21 +14,23 @@
 *   **Observability:** Built-in metrics endpoint and **HTML Dashboard**.
 
 
-## 💾 Durability & Persistence
+## 💾 Durability & Direct Append-Only WAL
 
-L3KV uses a high-performance **Buffered Write-Ahead Log (WAL)**.
+L3KV utilizes a high-performance **Direct Append-Only Write-Ahead Log (WAL)** designed for zero-copy durability without intermediate thread-pool handoff:
 
-*   **Fast Path:** Writes are appended to a 20MB in-memory buffer (`libconveyor`), achieving **0 ms latency** for the database engine.
-*   **Flush Policy:**
-    *   **Background:** The OS flushes dirty pages to disk asynchronously.
-    *   **Shutdown:** On receiving a signal (`SIGINT`, `SIGTERM`, `SIGBREAK`), the server forcefully flushes all buffers to `data.wal`.
-*   **Trade-off:**
-    *   **Graceful Shutdown:** 100% Data Durability GUARANTEED.
-    *   **Hard Crash / Power Loss:** Potential loss of buffered data (up to 20MB) that hasn't been flushed by the OS. The WAL integrity remains protected by CRC32, so no corruption occurs—only lost recent writes.
+*   **Fast Path:** Writes append directly to an append-only file stream (`data.wal` or configured path) protected by fine-grained thread-safe locking, eliminating secondary background thread pool overhead.
+*   **Sequential Durability:** Sequential streaming writes leverage OS kernel dirty page writeback, with explicit `flush()` and sync hooks during critical transactional commits.
+*   **Shutdown:** On receiving a shutdown signal (`SIGINT`, `SIGTERM`, `SIGBREAK`), the engine flushes and closes file descriptors gracefully.
+*   **Crash Recovery:** On startup, the service sequentially scans and recovers the WAL using buffered chunk replay. Partial or truncated writes at EOF are detected via CRC validation and safely truncated to the last consistent state.
 
-### Crash Recovery
-*   **Startup:** The service scans `data.wal` using a fast-read buffer.
-*   **Corrupt Entries:** Partial writes at the end of the log (from a hard crash) are detected via CRC32 mismatch and discarded, verifying the database to the last consistent state.
+## 🏛️ Architectural Learnings & Engine Roadmap
+
+Evaluations conducted with the **L3KVG Bifurcated Native Graph Substrate** and enterprise catalog benchmarks have yielded key architectural insights documented in [`docs/2026-10-10-l3kv-architectural-learnings-and-roadmap.md`](docs/2026-10-10-l3kv-architectural-learnings-and-roadmap.md):
+
+1. **Substrate Separation:** L3KV acts as the durable cold storage engine for document payloads and secondary index mappings, while L3KVG handles topological adjacency (sub-20ns hop latency) via slotted 4KB cache-aligned pages.
+2. **Metadata Inlining:** Demonstrates the value of small-record inlining directly inside primary key records to eliminate pointer dereferencing on hot lookups.
+3. **Pure Binary Buffers:** Complete transition from JSON text strings to native `lite3cpp::Buffer` eliminates serialization overhead across inter-process and on-disk paths.
+4. **Cache-Conscious B-Tree Layouts:** Roadmap incorporates slotted 4KB block allocations to maximize L1/L2 cache locality during range scans.
 
 ## 🌍 Geo-Distributed & Partition Tolerant
 L3KV is designed for global scale, running across multiple regions with unreliable networks:
