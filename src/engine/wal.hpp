@@ -2,6 +2,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -89,6 +90,7 @@ class WriteAheadLog {
   mutable std::mutex write_mutex_;
   std::atomic<size_t> bytes_written_{0};
   std::atomic<size_t> bytes_read_{0};
+  std::atomic<size_t> last_recovered_ops_{0};
   std::atomic<int> last_error_code_{0};
 
   static uint32_t compute_crc(uint8_t op, std::string_view key,
@@ -291,16 +293,24 @@ public:
                 const uint8_t *p = (const uint8_t *)payload.data();
                 const uint8_t *end = p + payload.size();
                 if (payload.size() >= 4) {
-                    uint32_t count = *(uint32_t *)p; p += 4;
+                    uint32_t count = 0;
+                    std::memcpy(&count, p, 4);
+                    p += 4;
                     for (uint32_t i = 0; i < count; ++i) {
                         if (p + 7 > end) break;
                         uint8_t b_op = *p++;
-                        uint16_t b_klen = *(uint16_t *)p; p += 2;
+                        uint16_t b_klen = 0;
+                        std::memcpy(&b_klen, p, 2);
+                        p += 2;
                         if (p + b_klen + 4 > end) break;
-                        std::string_view b_key((const char *)p, b_klen); p += b_klen;
-                        uint32_t b_vlen = *(uint32_t *)p; p += 4;
+                        std::string_view b_key((const char *)p, b_klen);
+                        p += b_klen;
+                        uint32_t b_vlen = 0;
+                        std::memcpy(&b_vlen, p, 4);
+                        p += 4;
                         if (p + b_vlen > end) break;
-                        std::string_view b_val((const char *)p, b_vlen); p += b_vlen;
+                        std::string_view b_val((const char *)p, b_vlen);
+                        p += b_vlen;
                         callback((WalOp)b_op, b_key, b_val);
                         recovered_ops++;
                     }
@@ -317,12 +327,196 @@ public:
         SetEndOfFile(file_.h);
 #else
         if (current_offset < fileSize64) {
-            (void)ftruncate(file_.fd, current_offset);
+            if (ftruncate(file_.fd, current_offset) < 0) {
+                last_error_code_.store(errno, std::memory_order_relaxed);
+            }
         }
         lseek(file_.fd, current_offset, SEEK_SET);
 #endif
         bytes_read_.store(current_offset, std::memory_order_relaxed);
     }
+    last_recovered_ops_.store(recovered_ops, std::memory_order_relaxed);
+  }
+
+  size_t last_recovered_ops() const {
+    return last_recovered_ops_.load(std::memory_order_relaxed);
+  }
+
+  uint64_t file_size() const {
+#ifdef _WIN32
+    LARGE_INTEGER fileSize;
+    if (!GetFileSizeEx(file_.h, &fileSize)) return 0;
+    return static_cast<uint64_t>(fileSize.QuadPart);
+#else
+    if (file_.fd < 0) return 0;
+    struct stat st;
+    if (fstat(file_.fd, &st) < 0) return 0;
+    return static_cast<uint64_t>(st.st_size);
+#endif
+  }
+
+  template <typename ChunkProducer>
+  bool compact_streaming(ChunkProducer&& next_chunk) {
+    if (path_.empty() || path_ == ":memory:") return false;
+    std::lock_guard<std::mutex> lock(write_mutex_);
+#ifndef _WIN32
+    std::string tmp_path = path_ + ".compact.tmp";
+    int tmp_fd = open(tmp_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (tmp_fd < 0) {
+      last_error_code_.store(errno, std::memory_order_relaxed);
+      return false;
+    }
+
+    auto write_all_tmp = [&](const void* data, size_t len) -> bool {
+      const char* ptr = static_cast<const char*>(data);
+      size_t rem = len;
+      while (rem > 0) {
+        ssize_t n = write(tmp_fd, ptr, rem);
+        if (n < 0) {
+          if (errno == EINTR) continue;
+          last_error_code_.store(errno, std::memory_order_relaxed);
+          return false;
+        }
+        if (n == 0) return false;
+        ptr += n;
+        rem -= static_cast<size_t>(n);
+      }
+      return true;
+    };
+
+    std::vector<std::pair<std::string, std::string>> owned_kv;
+    std::vector<uint8_t> buffer;
+    bool ok = true;
+    size_t total_compacted_bytes = 0;
+    size_t total_compacted_ops = 0;
+
+    while (next_chunk(owned_kv)) {
+      if (owned_kv.empty()) break;
+      if (owned_kv.size() > UINT32_MAX) {
+        ok = false;
+        break;
+      }
+      size_t payload_size = 4;
+      for (const auto& [k, v] : owned_kv) {
+        if (k.size() > UINT16_MAX || v.size() > UINT32_MAX) {
+          ok = false;
+          break;
+        }
+        size_t entry_size = 1 + 2 + k.size() + 4 + v.size();
+        if (entry_size > UINT32_MAX - payload_size) {
+          ok = false;
+          break;
+        }
+        payload_size += entry_size;
+      }
+      if (!ok || payload_size > UINT32_MAX) {
+        ok = false;
+        break;
+      }
+
+      size_t total_len = sizeof(LogHeader) + payload_size;
+      buffer.resize(total_len);
+      uint8_t* ptr = buffer.data();
+      uint8_t* payload_start = ptr + sizeof(LogHeader);
+      uint32_t count = static_cast<uint32_t>(owned_kv.size());
+      std::memcpy(payload_start, &count, 4);
+      uint8_t* p = payload_start + 4;
+      for (const auto& [k, v] : owned_kv) {
+        *p++ = static_cast<uint8_t>(WalOp::PUT);
+        uint16_t klen = static_cast<uint16_t>(k.size());
+        std::memcpy(p, &klen, 2); p += 2;
+        if (klen > 0) {
+          std::memcpy(p, k.data(), klen); p += klen;
+        }
+        uint32_t vlen = static_cast<uint32_t>(v.size());
+        std::memcpy(p, &vlen, 4); p += 4;
+        if (vlen > 0) {
+          std::memcpy(p, v.data(), vlen); p += vlen;
+        }
+      }
+      std::string_view payload_view(reinterpret_cast<const char*>(payload_start), payload_size);
+      uint32_t crc = compute_crc(static_cast<uint8_t>(WalOp::BATCH), "", payload_view);
+      LogHeader h{crc, static_cast<uint8_t>(WalOp::BATCH), 0, static_cast<uint32_t>(payload_size)};
+      std::memcpy(ptr, &h, sizeof(h));
+
+      if (!write_all_tmp(buffer.data(), buffer.size())) {
+        ok = false;
+        break;
+      }
+      total_compacted_bytes += buffer.size();
+      total_compacted_ops += owned_kv.size();
+      owned_kv.clear();
+    }
+
+    if (ok) {
+      while (fsync(tmp_fd) != 0) {
+        if (errno == EINTR) continue;
+        last_error_code_.store(errno, std::memory_order_relaxed);
+        ok = false;
+        break;
+      }
+    }
+    if (close(tmp_fd) != 0 && errno != EINTR) {
+      last_error_code_.store(errno, std::memory_order_relaxed);
+      ok = false;
+    }
+
+    std::error_code ec;
+    if (!ok) {
+      std::filesystem::remove(tmp_path, ec);
+      return false;
+    }
+
+    std::filesystem::rename(tmp_path, path_, ec);
+    if (ec) {
+      last_error_code_.store(ec.value(), std::memory_order_relaxed);
+      std::filesystem::remove(tmp_path, ec);
+      return false;
+    }
+
+    int new_fd = open(path_.c_str(), O_RDWR | O_CREAT, 0644);
+    if (new_fd < 0) {
+      last_error_code_.store(errno, std::memory_order_relaxed);
+      return false;
+    }
+    if (lseek(new_fd, 0, SEEK_END) < 0) {
+      last_error_code_.store(errno, std::memory_order_relaxed);
+      close(new_fd);
+      return false;
+    }
+    if (file_.fd >= 0) {
+      close(file_.fd);
+    }
+    file_.fd = new_fd;
+
+    auto parent = std::filesystem::path(path_).parent_path();
+    if (parent.empty()) parent = ".";
+    int dir_fd = open(parent.c_str(), O_RDONLY | O_DIRECTORY);
+    if (dir_fd < 0) {
+      last_error_code_.store(errno, std::memory_order_relaxed);
+      return false;
+    }
+    bool dir_ok = true;
+    while (fsync(dir_fd) != 0) {
+      if (errno == EINTR) continue;
+      last_error_code_.store(errno, std::memory_order_relaxed);
+      dir_ok = false;
+      break;
+    }
+    if (close(dir_fd) != 0 && errno != EINTR) {
+      last_error_code_.store(errno, std::memory_order_relaxed);
+      dir_ok = false;
+    }
+    if (!dir_ok) return false;
+
+    bytes_written_.store(total_compacted_bytes, std::memory_order_relaxed);
+    bytes_read_.store(total_compacted_bytes, std::memory_order_relaxed);
+    last_recovered_ops_.store(total_compacted_ops, std::memory_order_relaxed);
+    return true;
+#else
+    (void)next_chunk;
+    return false;
+#endif
   }
 
   void flush() {

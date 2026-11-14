@@ -7,12 +7,16 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
 # Dependencies
 find_package(Threads REQUIRED)
+enable_testing()
 
-set(LITE3CPP_DISABLE_OBSERVABILITY OFF CACHE BOOL "" FORCE)
+set(LITE3CPP_DISABLE_OBSERVABILITY ON CACHE BOOL "" FORCE)
 if(LITE3CPP_DISABLE_OBSERVABILITY)
     add_compile_definitions(LITE3CPP_DISABLE_OBSERVABILITY)
 endif()
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../lib/lite3-cpp ${CMAKE_CURRENT_BINARY_DIR}/lite3-cpp)
+if(LITE3CPP_DISABLE_OBSERVABILITY AND TARGET lite3-cpp)
+    target_compile_definitions(lite3-cpp PUBLIC LITE3CPP_DISABLE_OBSERVABILITY)
+endif()
 
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../lib/liblite3client ${CMAKE_CURRENT_BINARY_DIR}/liblite3client)
@@ -138,14 +142,17 @@ endif()
 add_executable(test_clock src/tests_cpp/test_clock.cpp src/engine/clock.cpp)
 target_include_directories(test_clock PRIVATE src)
 target_link_libraries(test_clock PRIVATE Threads::Threads)
+add_test(NAME test_clock COMMAND test_clock)
 
 add_executable(test_wal src/tests_cpp/test_wal.cpp)
 target_include_directories(test_wal PRIVATE src)
 target_link_libraries(test_wal PRIVATE Threads::Threads l3kv_engine)
+add_test(NAME test_wal COMMAND test_wal)
 
 add_executable(test_store src/tests_cpp/test_store.cpp src/engine/clock.cpp)
 target_include_directories(test_store PRIVATE src)
 target_link_libraries(test_store PRIVATE Threads::Threads l3kv_engine)
+add_test(NAME test_store COMMAND test_store)
 if(MSVC)
     add_definitions(-D_WIN32_WINNT=0x0A00 -DNOMINMAX)
 endif()
@@ -153,6 +160,7 @@ endif()
 add_executable(test_clock_simple src/tests_cpp/test_clock_simple.cpp src/engine/clock.cpp)
 target_include_directories(test_clock_simple PRIVATE src)
 target_link_libraries(test_clock_simple PRIVATE Threads::Threads)
+add_test(NAME test_clock_simple COMMAND test_clock_simple)
 
 add_executable(test_phase2 src/tests_cpp/test_phase2.cpp)
 target_include_directories(test_phase2 PRIVATE
@@ -165,10 +173,12 @@ target_link_libraries(test_phase2 PRIVATE
     lite3-cpp
     l3kv_engine
 )
+add_test(NAME test_phase2 COMMAND test_phase2)
 
 add_executable(test_merkle src/tests_cpp/test_merkle.cpp)
 target_include_directories(test_merkle PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR}/_deps/xxhash-src)
 target_link_libraries(test_merkle PRIVATE Threads::Threads xxhash)
+add_test(NAME test_merkle COMMAND test_merkle)
 
 add_executable(check_curve src/tests_cpp/check_curve.cpp)
 target_link_libraries(check_curve PRIVATE libzmq)
@@ -176,6 +186,7 @@ target_link_libraries(check_curve PRIVATE libzmq)
 add_executable(test_credentials src/tests_cpp/test_credentials.cpp)
 target_include_directories(test_credentials PRIVATE src)
 target_link_libraries(test_credentials PRIVATE Threads::Threads)
+add_test(NAME test_credentials COMMAND test_credentials)
 
 add_executable(test_mesh_stress src/tests_cpp/test_mesh_stress.cpp)
 target_include_directories(test_mesh_stress PRIVATE
@@ -188,6 +199,7 @@ target_link_libraries(test_mesh_stress PRIVATE
     lite3-cpp
     l3kv_engine
 )
+add_test(NAME test_mesh_stress COMMAND test_mesh_stress)
 
 add_executable(test_sync_simulation src/tests_cpp/test_sync_simulation.cpp)
 target_include_directories(test_sync_simulation PRIVATE
@@ -200,6 +212,7 @@ target_link_libraries(test_sync_simulation PRIVATE
     lite3-cpp
     l3kv_engine
 )
+add_test(NAME test_sync_simulation COMMAND test_sync_simulation)
 
 add_executable(test_sync_latency src/tests_cpp/test_sync_latency.cpp)
 target_include_directories(test_sync_latency PRIVATE
@@ -212,6 +225,7 @@ target_link_libraries(test_sync_latency PRIVATE
     lite3-cpp
     l3kv_engine
 )
+add_test(NAME test_sync_latency COMMAND test_sync_latency)
 
 add_executable(bench_twitter src/tests_cpp/bench_twitter.cpp)
 target_include_directories(bench_twitter PRIVATE

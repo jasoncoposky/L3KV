@@ -298,6 +298,7 @@ class Engine {
   MerkleTree merkle_;
   std::unique_ptr<ZstdManager> zstd_manager_;
   std::unique_ptr<CredentialManager> credentials_;
+  mutable std::shared_mutex compaction_mu_;
 
 
 public:
@@ -332,10 +333,63 @@ private:
   }
 
   uint64_t hash_blob(const std::shared_ptr<const Blob> &blob) {
-    if (!blob)
+    if (!blob || blob->buf_.size() == 0)
       return 0;
+    if (blob->compressed_ && zstd_manager_) {
+      std::string src(reinterpret_cast<const char *>(blob->buf_.data()),
+                      blob->buf_.size());
+      std::string dst;
+      zstd_manager_->decompress(src, dst, blob->original_size_);
+      return fnv1a_64(dst.data(), dst.size());
+    }
     auto v = blob->view();
     return fnv1a_64(v.data(), v.size());
+  }
+
+  static bool has_complete_routing_tag(std::string_view key) {
+    size_t start = key.find('{');
+    if (start == std::string_view::npos)
+      return false;
+    return key.find('}', start + 1) != std::string_view::npos;
+  }
+
+  static bool is_expired_meta_tombstone(std::string_view key,
+                                        std::string_view raw_bytes,
+                                        int64_t now_wall_us,
+                                        uint64_t tombstone_ttl_ms) {
+    if (!key.ends_with(":meta") || raw_bytes.empty()) {
+      return false;
+    }
+    try {
+      auto mbuf = lite3cpp::Buffer::from_view(
+          reinterpret_cast<const uint8_t *>(raw_bytes.data()),
+          raw_bytes.size());
+      if (mbuf.get_type(0, "tombstone") != lite3cpp::Type::Bool ||
+          !mbuf.get_bool(0, "tombstone")) {
+        return false;
+      }
+      if (tombstone_ttl_ms == 0) {
+        return true;
+      }
+      int64_t ts_us = 0;
+      auto ts_type = mbuf.get_type(0, "ts");
+      if (ts_type == lite3cpp::Type::Int64) {
+        ts_us = mbuf.get_i64(0, "ts");
+      } else if (ts_type == lite3cpp::Type::Float64) {
+        ts_us = static_cast<int64_t>(mbuf.get_f64(0, "ts"));
+      } else {
+        return false;
+      }
+      if (now_wall_us < ts_us) {
+        return false;
+      }
+      uint64_t age_us =
+          static_cast<uint64_t>(now_wall_us) - static_cast<uint64_t>(ts_us);
+      uint64_t age_ms = age_us / 1000ULL;
+      return age_ms >= tombstone_ttl_ms;
+    } catch (...) {
+      return false;
+    }
   }
 
 public:
@@ -512,6 +566,34 @@ public:
           }
         });
 
+    {
+      size_t total_live_keys = 0;
+      for (size_t i = 0; i < SHARDS; ++i) {
+        auto &s = *shards_[i];
+        for (auto it = s.map.begin(); it != s.map.end();) {
+          if (!it->second || it->second->buf_.size() == 0) {
+            if (it->second) {
+              uint64_t h = hash_blob(it->second);
+              if (h != 0) {
+                merkle_.apply_delta(it->first, h);
+              }
+            }
+            it = s.map.erase(it);
+          } else {
+            ++total_live_keys;
+            ++it;
+          }
+        }
+      }
+      uint64_t wal_bytes = wal_ ? wal_->file_size() : 0;
+      size_t rec_ops = wal_ ? wal_->last_recovered_ops() : 0;
+      if (wal_ &&
+          ((wal_bytes > 32ULL * 1024 * 1024 && rec_ops > total_live_keys * 2) ||
+           (wal_bytes > 256ULL * 1024 * 1024 && rec_ops > total_live_keys + 50000))) {
+        compact_wal_unlocked();
+      }
+    }
+
     for (size_t i = 0; i < SHARDS; ++i) {
       shards_[i]->core_thread = std::thread([this, i]() {
 #ifdef _WIN32
@@ -622,6 +704,8 @@ public:
         throw std::runtime_error("Unauthorized: Access Denied for key " + key);
     }
 
+    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
+
     auto now = clock_.now();
     std::string_view mkey_v = KeyBuilder::meta_key(key);
     std::string mkey_s(mkey_v);
@@ -645,6 +729,8 @@ public:
   }
 
   void patch_int(std::string key, std::string field, int64_t val) {
+    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
+
     auto now = clock_.now();
     std::string_view mkey_v = KeyBuilder::meta_key(key);
     std::string mkey_s(mkey_v);
@@ -668,6 +754,8 @@ public:
   }
 
   void patch_str(std::string key, std::string field, std::string val) {
+    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
+
     auto now = clock_.now();
     std::string_view mkey_v = KeyBuilder::meta_key(key);
     std::string mkey_s(mkey_v);
@@ -697,6 +785,8 @@ public:
         return false; // Access Denied
     }
 
+    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
+
     auto now = clock_.now();
     std::string_view mkey_v = KeyBuilder::meta_key(key);
     std::string mkey_s(mkey_v);
@@ -722,7 +812,9 @@ public:
   }
 
   void batch_put(const lite3cpp::Buffer &batch, uint32_t principal_id = ADMIN_UID) {
-    std::vector<BatchOp> wal_batch;
+    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
+
+    std::vector<std::pair<std::string, std::string>> owned_wal_entries;
     struct ShardWork {
       std::vector<std::pair<std::string, std::string>> updates;
     };
@@ -758,25 +850,36 @@ public:
       mbuf.set_i64(0, "n", now.node_id);
       std::string meta_val = mbuf.move_to_string();
 
-      wal_batch.push_back({WalOp::PUT, key, val});
-      wal_batch.push_back({WalOp::PUT, mkey_s, meta_val});
+      owned_wal_entries.emplace_back(key, val);
+      owned_wal_entries.emplace_back(mkey_s, meta_val);
 
-      shard_works[get_routing_shard(key)].updates.push_back({key, val});
-      shard_works[get_routing_shard(mkey_s)].updates.push_back({mkey_s, meta_val});
+      shard_works[get_routing_shard(key)].updates.emplace_back(std::move(key), std::move(val));
+      shard_works[get_routing_shard(mkey_s)].updates.emplace_back(std::move(mkey_s), std::move(meta_val));
     }
 
-    if (wal_batch.empty())
+    if (owned_wal_entries.empty())
       return;
+
+    std::vector<BatchOp> wal_batch;
+    wal_batch.reserve(owned_wal_entries.size());
+    for (const auto &[wk, wv] : owned_wal_entries) {
+      wal_batch.push_back({WalOp::PUT, wk, wv});
+    }
 
     wal_->append_batch(wal_batch);
 
+    std::vector<std::future<void>> futures;
+    futures.reserve(shard_works.size());
     for (auto &[shard_idx, work] : shard_works) {
-      auto &s = *shards_[shard_idx];
-      s.messages.enqueue({[this, updates = std::move(work.updates)]() mutable {
-        for (auto &p : updates) {
-          apply_put(p.first, p.second);
-        }
-      }});
+      futures.push_back(submit_to_shard_idx(
+          shard_idx, [this, updates = std::move(work.updates)]() mutable {
+            for (auto &p : updates) {
+              apply_put(p.first, p.second);
+            }
+          }));
+    }
+    for (auto &fut : futures) {
+      fut.get();
     }
   }
 
@@ -815,6 +918,8 @@ public:
                              std::map<size_t, ShardMutation> shard_mutations) {
     if (wal_ops.empty() && shard_mutations.empty()) return;
 
+    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
+
     if (!wal_ops.empty() && wal_) {
       wal_->append_batch(wal_ops);
     }
@@ -836,6 +941,8 @@ public:
   }
 
   inline void apply_mutation(const Mutation &m) {
+    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
+
     std::string_view meta_key_v = KeyBuilder::meta_key(m.key);
     std::string meta_key_lookup(meta_key_v);
     auto buf = get(meta_key_lookup);
@@ -867,11 +974,12 @@ public:
     }
     std::string meta_val = mbuf.move_to_string();
 
+    std::string val_str;
     std::vector<BatchOp> wal_batch;
     if (m.is_delete) {
       wal_batch.push_back({WalOp::DELETE_, m.key, ""});
     } else {
-      std::string val_str(m.value.begin(), m.value.end());
+      val_str.assign(reinterpret_cast<const char *>(m.value.data()), m.value.size());
       wal_batch.push_back({WalOp::PUT, m.key, val_str});
     }
     wal_batch.push_back({WalOp::PUT, meta_key_lookup, meta_val});
@@ -881,7 +989,6 @@ public:
     if (m.is_delete) {
       apply_del(m.key);
     } else {
-      std::string val_str(m.value.begin(), m.value.end());
       apply_put(m.key, val_str);
     }
     apply_put(meta_key_lookup, meta_val);
@@ -890,6 +997,95 @@ public:
   void set_logger(std::shared_ptr<ILogger> logger) { logger_ = logger; }
   ZstdManager* get_zstd_manager() const { return zstd_manager_.get(); }
   void flush() { wal_->flush(); }
+
+  bool compact_wal_unlocked(uint64_t tombstone_ttl_ms = 24ULL * 3600ULL * 1000ULL) {
+    if (!wal_) return false;
+    uint64_t old_bytes = wal_->file_size();
+    size_t old_ops = wal_->last_recovered_ops();
+    const int64_t now_wall_us = clock_.now().wall_time;
+    size_t shard_idx = 0;
+    auto it = shards_[0]->map.begin();
+    size_t live_keys = 0;
+
+    bool ok = wal_->compact_streaming([&](std::vector<std::pair<std::string, std::string>>& out_chunk) -> bool {
+      out_chunk.clear();
+      size_t chunk_bytes = 0;
+      while (shard_idx < SHARDS) {
+        auto& s = *shards_[shard_idx];
+        while (it != s.map.end()) {
+          if (!it->second || it->second->buf_.size() == 0) {
+            if (it->second) {
+              uint64_t h = hash_blob(it->second);
+              if (h != 0) {
+                merkle_.apply_delta(it->first, h);
+              }
+            }
+            it = s.map.erase(it);
+            continue;
+          }
+          std::string val_str;
+          if (it->second->compressed_) {
+            std::string src(reinterpret_cast<const char*>(it->second->buf_.data()), it->second->buf_.size());
+            zstd_manager_->decompress(src, val_str, it->second->original_size_);
+          } else {
+            val_str.assign(reinterpret_cast<const char*>(it->second->buf_.data()), it->second->buf_.size());
+          }
+
+          if (is_expired_meta_tombstone(it->first, val_str, now_wall_us, tombstone_ttl_ms)) {
+            std::string_view base_key(it->first.data(), it->first.size() - 5);
+            auto& base_s = get_shard(base_key);
+            auto base_it = base_s.map.find(base_key);
+            bool base_live = (base_it != base_s.map.end() && base_it->second &&
+                              base_it->second->buf_.size() > 0);
+            if (!base_live) {
+              uint64_t h = fnv1a_64(val_str.data(), val_str.size());
+              if (h != 0) {
+                merkle_.apply_delta(it->first, h);
+              }
+              it = s.map.erase(it);
+              continue;
+            }
+          }
+
+          chunk_bytes += it->first.size() + val_str.size() + 16;
+          out_chunk.emplace_back(it->first, std::move(val_str));
+          ++live_keys;
+          ++it;
+          if (out_chunk.size() >= 5000 || chunk_bytes >= 16ULL * 1024 * 1024) {
+            return true;
+          }
+        }
+        ++shard_idx;
+        if (shard_idx < SHARDS) {
+          it = shards_[shard_idx]->map.begin();
+        }
+      }
+      return !out_chunk.empty();
+    });
+
+    if (ok) {
+      std::fprintf(stderr,
+                   "[WAL COMPACT] Compacted kv.wal from %llu bytes (%zu ops) to %llu bytes (%zu live keys)\n",
+                   static_cast<unsigned long long>(old_bytes),
+                   old_ops,
+                   static_cast<unsigned long long>(wal_->file_size()),
+                   live_keys);
+    }
+    return ok;
+  }
+
+  bool compact_wal(uint64_t tombstone_ttl_ms = 24ULL * 3600ULL * 1000ULL) {
+    if (!wal_) return false;
+    std::unique_lock<std::shared_mutex> comp_lk(compaction_mu_);
+    wait_all_shards();
+    std::vector<std::unique_lock<std::shared_mutex>> locks;
+    locks.reserve(SHARDS);
+    for (size_t i = 0; i < SHARDS; ++i) {
+      locks.emplace_back(shards_[i]->read_mu);
+    }
+    return compact_wal_unlocked(tombstone_ttl_ms);
+  }
+
   void wait_all_shards() {
     std::vector<std::future<void>> futures;
     for (size_t i = 0; i < SHARDS; ++i) {
@@ -912,6 +1108,7 @@ public:
       auto fut = submit_to_shard_idx(i, [&, i, bucket_idx]() {
         std::vector<std::pair<std::string, uint64_t>> local_res;
         auto &shard = *shards_[i];
+        std::shared_lock lock(shard.read_mu);
         for (auto &[k, v] : shard.map) {
           uint64_t kh = fnv1a_64(k.c_str(), k.size());
           uint32_t b = (kh >> 48) & 0xFFFF;
@@ -972,6 +1169,47 @@ public:
     }
   }
 
+  std::string get_max_key_with_prefix(const std::string &prefix) {
+    std::string upper = prefix;
+    while (!upper.empty() &&
+           static_cast<unsigned char>(upper.back()) == 0xFFu) {
+      upper.pop_back();
+    }
+    const bool has_upper = !upper.empty();
+    if (has_upper) {
+      upper.back() =
+          static_cast<char>(static_cast<unsigned char>(upper.back()) + 1u);
+    }
+
+    std::string max_key;
+    bool found = false;
+
+    auto scan_shard = [&](Shard &s) {
+      std::shared_lock lock(s.read_mu);
+      auto it = has_upper ? s.map.lower_bound(upper) : s.map.end();
+      while (it != s.map.begin()) {
+        --it;
+        if (!it->first.starts_with(prefix)) break;
+        if (it->first.ends_with(":meta")) continue;
+        if (!it->second || it->second->buf_.size() == 0) continue;
+        if (!found || it->first > max_key) {
+          max_key = it->first;
+          found = true;
+        }
+        break;
+      }
+    };
+
+    if (has_complete_routing_tag(prefix)) {
+      scan_shard(*shards_[get_routing_shard(prefix)]);
+    } else {
+      for (size_t i = 0; i < SHARDS; ++i) {
+        scan_shard(*shards_[i]);
+      }
+    }
+    return max_key;
+  }
+
   std::vector<std::pair<std::string, std::string>>
   get_prefix_entries_all_shards(const std::string &prefix,
                                 const std::string &start_key = "",
@@ -1029,6 +1267,7 @@ public:
       futures.push_back(submit_to_shard_idx(i, [this, i, prefix, start_key, limit_per_shard]() {
         std::vector<std::string> chunk;
         auto &s = *shards_[i];
+        std::shared_lock lock(s.read_mu);
         
         std::string effective_start = start_key;
         if (effective_start < prefix) effective_start = prefix;
