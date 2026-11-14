@@ -1007,6 +1007,14 @@ public:
     auto it = shards_[0]->map.begin();
     size_t live_keys = 0;
 
+    using MapIter = decltype(shards_[0]->map.begin());
+    struct DeferredErasure {
+      size_t shard;
+      MapIter it;
+      uint64_t hash;
+    };
+    std::vector<DeferredErasure> deferred_erasures;
+
     bool ok = wal_->compact_streaming([&](std::vector<std::pair<std::string, std::string>>& out_chunk) -> bool {
       out_chunk.clear();
       size_t chunk_bytes = 0;
@@ -1014,13 +1022,9 @@ public:
         auto& s = *shards_[shard_idx];
         while (it != s.map.end()) {
           if (!it->second || it->second->buf_.size() == 0) {
-            if (it->second) {
-              uint64_t h = hash_blob(it->second);
-              if (h != 0) {
-                merkle_.apply_delta(it->first, h);
-              }
-            }
-            it = s.map.erase(it);
+            uint64_t h = it->second ? hash_blob(it->second) : 0;
+            deferred_erasures.push_back({shard_idx, it, h});
+            ++it;
             continue;
           }
           std::string val_str;
@@ -1039,10 +1043,8 @@ public:
                               base_it->second->buf_.size() > 0);
             if (!base_live) {
               uint64_t h = fnv1a_64(val_str.data(), val_str.size());
-              if (h != 0) {
-                merkle_.apply_delta(it->first, h);
-              }
-              it = s.map.erase(it);
+              deferred_erasures.push_back({shard_idx, it, h});
+              ++it;
               continue;
             }
           }
@@ -1064,6 +1066,12 @@ public:
     });
 
     if (ok) {
+      for (const auto& de : deferred_erasures) {
+        if (de.hash != 0) {
+          merkle_.apply_delta(de.it->first, de.hash);
+        }
+        shards_[de.shard]->map.erase(de.it);
+      }
       std::fprintf(stderr,
                    "[WAL COMPACT] Compacted kv.wal from %llu bytes (%zu ops) to %llu bytes (%zu live keys)\n",
                    static_cast<unsigned long long>(old_bytes),

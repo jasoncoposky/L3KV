@@ -343,6 +343,7 @@ public:
   }
 
   uint64_t file_size() const {
+    std::lock_guard<std::mutex> lock(write_mutex_);
 #ifdef _WIN32
     LARGE_INTEGER fileSize;
     if (!GetFileSizeEx(file_.h, &fileSize)) return 0;

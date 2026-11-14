@@ -500,6 +500,124 @@ void test_compact_wal_merkle_and_tombstones() {
   std::cout << "[PASS] compact_wal + Restart + Merkle + Tombstone TTL GC" << std::endl;
 }
 
+void test_compact_wal_rollback_on_failure() {
+  std::cout << "TEST: compact_streaming & compact_wal Rollback on Failure..." << std::endl;
+
+  // Part 1: Direct WriteAheadLog::compact_streaming mid-stream failure (> UINT16_MAX key)
+  std::string wal_path = "test_wal_rollback.wal";
+  std::filesystem::remove(wal_path);
+  std::filesystem::remove(wal_path + ".compact.tmp");
+  {
+    WriteAheadLog wal(wal_path);
+    wal.recover([](WalOp, std::string_view, std::string_view) {});
+    wal.append(WalOp::PUT, "orig_k1", "orig_v1");
+    wal.append(WalOp::PUT, "orig_k2", "orig_v2");
+    wal.flush();
+    uint64_t orig_size = wal.file_size();
+    require_check(orig_size > 0, "Expected non-zero initial WAL size");
+
+    int step = 0;
+    bool ok = wal.compact_streaming(
+        [&](std::vector<std::pair<std::string, std::string>> &chunk) -> bool {
+          chunk.clear();
+          if (step == 0) {
+            chunk.emplace_back("chunk1_ok", "val1");
+            ++step;
+            return true;
+          }
+          if (step == 1) {
+            chunk.emplace_back(std::string(70000, 'x'), "oversize_key");
+            ++step;
+            return true;
+          }
+          return false;
+        });
+    require_check(!ok, "compact_streaming should return false on >UINT16_MAX key");
+    require_check(!std::filesystem::exists(wal_path + ".compact.tmp"),
+                  ".compact.tmp must be unlinked on compact_streaming failure");
+    require_check(wal.file_size() == orig_size,
+                  "Original WAL file size must be unchanged on compact_streaming failure");
+
+    // Verify file_.fd remains valid for subsequent appends
+    wal.append(WalOp::PUT, "orig_k3", "orig_v3");
+    wal.flush();
+  }
+  {
+    WriteAheadLog wal_rec(wal_path);
+    std::vector<std::pair<std::string, std::string>> recovered;
+    wal_rec.recover([&](WalOp op, std::string_view k, std::string_view v) {
+      if (op == WalOp::PUT) {
+        recovered.emplace_back(std::string(k), std::string(v));
+      }
+    });
+    require_check(recovered.size() == 3 &&
+                      recovered[0] == std::make_pair(std::string("orig_k1"), std::string("orig_v1")) &&
+                      recovered[1] == std::make_pair(std::string("orig_k2"), std::string("orig_v2")) &&
+                      recovered[2] == std::make_pair(std::string("orig_k3"), std::string("orig_v3")),
+                  "Original WAL entries + post-failure append must survive failed compact_streaming");
+  }
+  std::filesystem::remove(wal_path);
+
+  // Part 2: Engine::compact_wal(0) deferred s.map & merkle_ pruning on failure
+  std::string eng_path = "test_engine_rollback.wal";
+  std::filesystem::remove(eng_path);
+  std::filesystem::remove(eng_path + ".compact.tmp");
+
+  uint64_t root_disk = 0;
+  {
+    Engine db(eng_path, 1);
+    db.put("{rb}:a_live", R"({"v":1})");
+    db.put("{rb}:b_del", R"({"v":2})");
+    require_check(db.del("{rb}:b_del"), "del({rb}:b_del) failed");
+    db.wait_all_shards();
+
+    root_disk = db.get_merkle_root_hash();
+    uint64_t wal_size_before = std::filesystem::file_size(eng_path);
+
+    // Inject an in-memory >UINT16_MAX key in the SAME {rb} shard sorted AFTER {rb}:b_del:meta
+    // so compact_wal(0) scans {rb}:b_del and {rb}:b_del:meta BEFORE hitting the oversize failure.
+    std::string oversize_key = "{rb}:z_" + std::string(70000, 'z');
+    db.apply_put(oversize_key, R"({"v":3})");
+    uint64_t root_with_oversize = db.get_merkle_root_hash();
+
+    require_check(!db.compact_wal(0),
+                  "compact_wal(0) must return false when a key exceeds UINT16_MAX");
+    require_check(!std::filesystem::exists(eng_path + ".compact.tmp"),
+                  ".compact.tmp must be unlinked after failed compact_wal(0)");
+    require_check(std::filesystem::file_size(eng_path) == wal_size_before,
+                  "On-disk WAL size must remain intact after failed compact_wal(0)");
+
+    auto tmeta = db.get("{rb}:b_del:meta");
+    require_check(tmeta.size() > 0 && tmeta.get_bool(0, "tombstone") == true,
+                  "Tombstone {rb}:b_del:meta was prematurely erased on failed compact_wal(0)");
+    require_check(db.get_merkle_root_hash() == root_with_oversize,
+                  "In-memory Merkle root was mutated despite failed compact_wal(0)");
+
+    // Remove the unpersisted oversize key and verify Merkle root matches on-disk WAL state
+    db.apply_del(oversize_key);
+    require_check(db.get_merkle_root_hash() == root_disk,
+                  "Merkle root after removing unpersisted oversize key must match root_disk");
+  }
+  {
+    Engine db_restarted(eng_path, 1);
+    db_restarted.wait_all_shards();
+    require_check(db_restarted.get_merkle_root_hash() == root_disk,
+                  "Restarted Merkle root mismatch after rolled-back compact_wal(0)");
+    auto live_v = db_restarted.get("{rb}:a_live");
+    require_check(live_v.size() > 0 && live_v.get_i64(0, "v") == 1,
+                  "{rb}:a_live missing after rolled-back compact_wal(0)");
+    require_check(db_restarted.get("{rb}:b_del").size() == 0,
+                  "{rb}:b_del resurrected after rolled-back compact_wal(0)");
+    auto tmeta = db_restarted.get("{rb}:b_del:meta");
+    require_check(tmeta.size() > 0 && tmeta.get_bool(0, "tombstone") == true,
+                  "{rb}:b_del:meta missing after restart following rolled-back compact_wal(0)");
+  }
+
+  std::filesystem::remove(eng_path);
+  std::filesystem::remove(eng_path + ".compact.tmp");
+  std::cout << "[PASS] compact_streaming & compact_wal Rollback on Failure" << std::endl;
+}
+
 void test_concurrent_writers_and_compaction() {
   std::cout << "TEST: Concurrent Writers vs Online compact_wal() Stress..." << std::endl;
   std::string path = "test_concurrent_compact.wal";
@@ -654,6 +772,7 @@ int main() {
     test_user_credentials();
     test_get_max_key_with_prefix();
     test_compact_wal_merkle_and_tombstones();
+    test_compact_wal_rollback_on_failure();
     test_concurrent_writers_and_compaction();
     std::cout << "All Store Tests Passed Deterministically!" << std::endl;
   } catch (const std::exception &e) {
