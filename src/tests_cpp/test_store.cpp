@@ -760,8 +760,363 @@ void test_concurrent_writers_and_compaction() {
   std::cout << "[PASS] Concurrent Writers vs Online compact_wal() Stress" << std::endl;
 }
 
+void test_wave1_optimizations_and_fixes() {
+  std::cout << "TEST: Wave 1 P0/P1 Fixes (Co-routing, >1KB Keys, Zstd/Blob/batch_get, Pagination, Patch ACL)..." << std::endl;
+
+  // 1. Co-routing of untagged keys and :meta sidecars across 100 distinct keys + {tag} routing
+  {
+    std::string path = "test_wave1_coroute.wal";
+    std::filesystem::remove(path);
+    {
+      Engine db(path, 1);
+      require_check(db.get_routing_shard("alpha_key") == db.get_routing_shard("alpha_key:meta"),
+                    "alpha_key and alpha_key:meta must co-route to the same shard");
+      for (int i = 0; i < 100; ++i) {
+        std::string k = "untagged_doc_" + std::to_string(i) + "_payload";
+        require_check(db.get_routing_shard(k) == db.get_routing_shard(k + ":meta"),
+                      "Untagged key and :meta failed to co-route for " + k);
+      }
+      size_t tag_shard = db.get_routing_shard("{tenant42}:a");
+      require_check(db.get_routing_shard("{tenant42}:b") == tag_shard,
+                    "{tag} keys with same tag must share shard");
+      require_check(db.get_routing_shard("{tenant42}:a:meta") == tag_shard,
+                    "{tag} :meta key must route by {tag}");
+    }
+    std::filesystem::remove(path);
+  }
+
+  // 2. Keys > 1024 bytes (2048 bytes) round-trip cleanly without clobbering empty key ""
+  {
+    std::string path = "test_wave1_longkey.wal";
+    std::filesystem::remove(path);
+    std::string long_key(2048, 'L');
+    {
+      Engine db(path, 1);
+      db.put("", R"({"empty_key_marker":777})");
+      db.put(long_key, R"({"long_val":2048})");
+      db.wait_all_shards();
+
+      auto empty_val = db.get("");
+      require_check(empty_val.size() > 0 &&
+                        empty_val.try_get_i64(0, "empty_key_marker").value_or(0) == 777,
+                    "2048-byte key put clobbered empty key \"\"!");
+
+      auto lval = db.get(long_key);
+      require_check(lval.size() > 0 && lval.get_i64(0, "long_val") == 2048,
+                    "2048-byte key get mismatch");
+
+      auto lmeta = db.get(long_key + ":meta");
+      require_check(lmeta.size() > 0 && lmeta.get_i64(0, "ts") > 0,
+                    "2048-byte key :meta missing or invalid");
+
+      require_check(db.del(long_key), "del(2048-byte key) returned false");
+      db.wait_all_shards();
+      require_check(db.get(long_key).size() == 0, "2048-byte key still present after del");
+      auto empty_after = db.get("");
+      require_check(empty_after.size() > 0 &&
+                        empty_after.try_get_i64(0, "empty_key_marker").value_or(0) == 777,
+                    "del(2048-byte key) clobbered empty key \"\"!");
+    }
+    std::filesystem::remove(path);
+  }
+
+  // 3. Zstd >=512B threshold, Blob::content_hash(), batch_get Type::Bytes parity, and Engine::get_blob
+  {
+    std::string path = "test_wave1_zstd_blob.wal";
+    std::filesystem::remove(path);
+    {
+      Engine db(path, 1);
+      std::string pad(1600, 'z');
+      for (int i = 0; i < 75; ++i) {
+        db.put("sample_" + std::to_string(i),
+               "{\"idx\":" + std::to_string(i) + ",\"pad\":\"" + pad + "\"}");
+      }
+      db.wait_all_shards();
+      require_check(db.get_zstd_manager()->is_active(),
+                    "ZstdManager should be active after 75 x 1.6KB samples");
+
+      std::string small_key = "small_doc";
+      std::string large_key = "large_doc";
+      db.put(small_key, R"({"tiny":42,"label":"short"})");
+      db.put(large_key, "{\"idx\":999,\"pad\":\"" + pad + "\"}");
+      db.wait_all_shards();
+
+      auto small_raw = db.get_view(small_key);
+      auto small_meta_raw = db.get_view(small_key + ":meta");
+      auto large_raw = db.get_view(large_key);
+      auto large_meta_raw = db.get_view(large_key + ":meta");
+
+      require_check(small_raw != nullptr && !small_raw->compressed_,
+                    "Small blob (<512B) must stay uncompressed");
+      require_check(small_meta_raw != nullptr && !small_meta_raw->compressed_,
+                    "Small key :meta blob must stay uncompressed");
+      require_check(large_meta_raw != nullptr && !large_meta_raw->compressed_,
+                    "Large key :meta blob must stay uncompressed");
+      require_check(large_raw != nullptr && large_raw->compressed_,
+                    "Large compressible blob (>=1024B) must be compressed");
+
+      auto small_buf = db.get(small_key);
+      auto large_buf = db.get(large_key);
+      require_check(small_raw->content_hash() ==
+                        XXH3_64bits(small_buf.data(), small_buf.size()),
+                    "Uncompressed Blob::content_hash() mismatch");
+      require_check(large_raw->content_hash() ==
+                        XXH3_64bits(large_buf.data(), large_buf.size()),
+                    "Compressed Blob::content_hash() must equal XXH3 of uncompressed Lite3 bytes");
+
+      // batch_get must return Type::Bytes for BOTH uncompressed and compressed keys with exact byte parity
+      auto bres = db.batch_get({small_key, large_key});
+      require_check(bres.get_type(0, small_key) == lite3cpp::Type::Bytes,
+                    "batch_get must store uncompressed value as Type::Bytes");
+      require_check(bres.get_type(0, large_key) == lite3cpp::Type::Bytes,
+                    "batch_get must store compressed value as Type::Bytes (not Type::String!)");
+
+      auto b_small = bres.get_bytes(0, small_key);
+      auto b_large = bres.get_bytes(0, large_key);
+      require_check(b_small.size() == small_buf.size() &&
+                        std::memcmp(b_small.data(), small_buf.data(), small_buf.size()) == 0,
+                    "batch_get uncompressed bytes mismatch vs get()");
+      require_check(b_large.size() == large_buf.size() &&
+                        std::memcmp(b_large.data(), large_buf.data(), large_buf.size()) == 0,
+                    "batch_get compressed bytes mismatch vs get()");
+
+      // Engine::get_blob zero-copy uncompressed Blob API + ACL check
+      auto sblob = db.get_blob(small_key);
+      require_check(sblob != nullptr && !sblob->compressed_,
+                    "get_blob(small_key) must return uncompressed Blob");
+      auto sview = lite3cpp::Buffer::from_view(sblob->buf_.data(), sblob->buf_.size());
+      require_check(sview.get_i64(0, "tiny") == 42 && sview.get_str(0, "label") == "short",
+                    "get_blob(small_key) payload mismatch");
+
+      auto lblob = db.get_blob(large_key);
+      require_check(lblob != nullptr && !lblob->compressed_,
+                    "get_blob(large_key) must return decompressed Blob with compressed_==false");
+      require_check(lblob->buf_.size() == large_buf.size() &&
+                        std::memcmp(lblob->buf_.data(), large_buf.data(), large_buf.size()) == 0,
+                    "get_blob(large_key) payload mismatch");
+
+      require_check(db.get_blob("non_existent_key") == nullptr,
+                    "get_blob on missing key must return nullptr");
+
+      // ACL enforcement on get_blob for non-admin principal
+      db.credentials().register_user(701, "reader", "rk701");
+      db.credentials().set_acl(701, "small_", Permission::READ);
+      require_check(db.get_blob(small_key, 701) != nullptr,
+                    "Authorized principal should read small_key via get_blob");
+      require_check(db.get_blob(large_key, 701) == nullptr,
+                    "Unauthorized principal must get nullptr from get_blob");
+
+      db.del(small_key);
+      require_check(db.get_blob(small_key) == nullptr,
+                    "get_blob on deleted key must return nullptr");
+    }
+    std::filesystem::remove(path);
+  }
+
+  // 4. Strict > start_key prefix pagination (zero boundary duplicates), lexicographical order, and {tag} fast-path
+  {
+    std::string path = "test_wave1_pagination.wal";
+    std::filesystem::remove(path);
+    {
+      Engine db(path, 1);
+      std::vector<std::string> expected_p;
+      for (int i = 0; i < 25; ++i) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "p:%02d", i);
+        expected_p.emplace_back(buf);
+        db.put(buf, "{\"i\":" + std::to_string(i) + "}");
+      }
+      db.put("p:12_deleted", R"({"del":true})");
+      db.del("p:12_deleted");
+      db.put("o:99", R"({"other":1})");
+      db.put("q:00", R"({"other":2})");
+
+      // Paginate get_prefix_keys_all_shards
+      std::vector<std::string> collected_keys;
+      std::string cursor;
+      int guard = 0;
+      while (true) {
+        auto page = db.get_prefix_keys_all_shards("p:", cursor, 6);
+        if (page.empty()) break;
+        require_check(page.size() <= 6, "get_prefix_keys_all_shards exceeded page limit");
+        if (!cursor.empty()) {
+          require_check(page.front() > cursor,
+                        "Boundary duplicate or non-advancing cursor in get_prefix_keys_all_shards: front=" +
+                            page.front() + " cursor=" + cursor);
+        }
+        for (size_t j = 1; j < page.size(); ++j) {
+          require_check(page[j - 1] < page[j], "Page keys not strictly sorted");
+        }
+        collected_keys.insert(collected_keys.end(), page.begin(), page.end());
+        cursor = page.back();
+        require_check(++guard <= 10, "Pagination loop did not terminate");
+      }
+      require_check(collected_keys == expected_p,
+                    "Paginated get_prefix_keys_all_shards mismatch vs expected 25 sorted keys");
+
+      // Paginate get_prefix_entries_all_shards
+      std::vector<std::string> collected_entry_keys;
+      cursor.clear();
+      guard = 0;
+      while (true) {
+        auto page = db.get_prefix_entries_all_shards("p:", cursor, 7);
+        if (page.empty()) break;
+        require_check(page.size() <= 7, "get_prefix_entries_all_shards exceeded page limit");
+        if (!cursor.empty()) {
+          require_check(page.front().first > cursor,
+                        "Boundary duplicate in get_prefix_entries_all_shards");
+        }
+        for (const auto &[k, v] : page) {
+          require_check(!v.empty(), "Empty entry value in get_prefix_entries_all_shards");
+          collected_entry_keys.push_back(k);
+        }
+        cursor = page.back().first;
+        require_check(++guard <= 10, "Entries pagination loop did not terminate");
+      }
+      require_check(collected_entry_keys == expected_p,
+                    "Paginated get_prefix_entries_all_shards mismatch");
+
+      // Paginate single-shard get_prefix_chunk with limit=1 (catches chunk.empty() && >= start_key bug!)
+      std::vector<std::string> expected_tag;
+      for (int i = 0; i < 9; ++i) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "n:{0100}:%02d", i);
+        expected_tag.emplace_back(buf);
+        db.put(buf, "{\"t\":" + std::to_string(i) + "}");
+      }
+      db.put("n:{0200}:00", R"({"t":999})");
+
+      size_t tag_shard = db.get_routing_shard("n:{0100}:");
+      std::vector<std::string> chunk_keys;
+      cursor.clear();
+      guard = 0;
+      while (true) {
+        auto cpage = db.get_prefix_chunk("n:{0100}:", tag_shard, cursor, 1);
+        if (cpage.empty()) break;
+        if (!cursor.empty()) {
+          require_check(cpage.front().first > cursor,
+                        "get_prefix_chunk failed to advance strictly past start_key with limit=1");
+        }
+        chunk_keys.push_back(cpage.front().first);
+        cursor = cpage.front().first;
+        require_check(++guard <= 15, "get_prefix_chunk infinite pagination loop");
+      }
+      require_check(chunk_keys == expected_tag,
+                    "get_prefix_chunk single-shard pagination mismatch");
+
+      // {tag}-prefixed get_prefix_keys_all_shards fast-path
+      std::vector<std::string> fast_keys;
+      cursor.clear();
+      while (true) {
+        auto page = db.get_prefix_keys_all_shards("n:{0100}:", cursor, 4);
+        if (page.empty()) break;
+        fast_keys.insert(fast_keys.end(), page.begin(), page.end());
+        cursor = page.back();
+      }
+      require_check(fast_keys == expected_tag,
+                    "{tag} fast-path get_prefix_keys_all_shards mismatch");
+    }
+    std::filesystem::remove(path);
+  }
+
+  // 5. patch_int & patch_str: WRITE ACL check, valid integer :meta HLC fields, and ':' in field names
+  {
+    std::string path = "test_wave1_patch.wal";
+    std::filesystem::remove(path);
+    uint64_t root_before = 0;
+    {
+      Engine db(path, 1);
+      db.credentials().register_user(501, "patch_user", "pk501");
+      db.credentials().set_acl(501, "ro:", Permission::READ);
+      db.credentials().set_acl(501, "rw:", Permission::READ | Permission::WRITE);
+
+      db.put("ro:item", R"({"cnt":1,"label":"orig"})");
+      db.put("rw:item", R"({"stats:cnt":10,"ns:label":"init"})");
+
+      bool blocked_int = false;
+      try {
+        db.patch_int("ro:item", "cnt", 99, 501);
+      } catch (const std::exception &) {
+        blocked_int = true;
+      }
+      require_check(blocked_int, "patch_int must reject principal without Permission::WRITE");
+
+      bool blocked_str = false;
+      try {
+        db.patch_str("ro:item", "label", "hacked", 501);
+      } catch (const std::exception &) {
+        blocked_str = true;
+      }
+      require_check(blocked_str, "patch_str must reject principal without Permission::WRITE");
+
+      auto ro_val = db.get("ro:item");
+      require_check(ro_val.get_i64(0, "cnt") == 1 && ro_val.get_str(0, "label") == "orig",
+                    "Rejected patch mutated ro:item!");
+
+      db.patch_int("rw:item", "stats:cnt", 42, 501);
+      db.patch_str("rw:item", "ns:label", "left:mid:right", 501);
+      db.wait_all_shards();
+
+      auto rw_val = db.get("rw:item");
+      require_check(rw_val.get_i64(0, "stats:cnt") == 42 &&
+                        rw_val.get_str(0, "ns:label") == "left:mid:right",
+                    "Authorized patch_int/patch_str with ':' in field failed");
+
+      auto rw_meta = db.get("rw:item:meta");
+      require_check(rw_meta.size() > 0, "rw:item:meta missing after patch");
+      require_check(rw_meta.try_get_i64(0, "ts").value_or(0) > 0,
+                    "patch must update :meta with integer \"ts\" > 0");
+      require_check(rw_meta.try_get_i64(0, "l").has_value(),
+                    "patch must update :meta with integer \"l\"");
+      require_check(rw_meta.try_get_i64(0, "n").value_or(0) == 1,
+                    "patch must update :meta with integer \"n\" == node_id");
+      require_check(!rw_meta.try_get_str(0, "stats:cnt").has_value() &&
+                        !rw_meta.try_get_str(0, "ns:label").has_value(),
+                    "patch must NOT pollute :meta with <field>:\"w:l:n\" strings");
+
+      root_before = db.get_merkle_root_hash();
+    }
+    {
+      Engine db_rec(path, 1);
+      db_rec.wait_all_shards();
+      auto rw_val = db_rec.get("rw:item");
+      require_check(rw_val.size() > 0 &&
+                        rw_val.get_i64(0, "stats:cnt") == 42 &&
+                        rw_val.get_str(0, "ns:label") == "left:mid:right",
+                    "WAL recovery failed for patch_int/patch_str with ':' in field name");
+      require_check(db_rec.get_merkle_root_hash() == root_before,
+                    "Merkle root mismatch after recovering colon-field patches");
+    }
+    std::filesystem::remove(path);
+  }
+
+  // 6. Backward-compatible WAL recovery of legacy "field:val" PATCH_I64 / PATCH_STR frames
+  {
+    std::string path = "test_wave1_legacy_patch.wal";
+    std::filesystem::remove(path);
+    {
+      WriteAheadLog wal(path);
+      wal.append(WalOp::PUT, "legacy_doc", R"({"age":10,"city":"LA"})");
+      wal.append(WalOp::PATCH_I64, "legacy_doc", "age:33");
+      wal.append(WalOp::PATCH_STR, "legacy_doc", "city:NYC");
+      wal.flush();
+    }
+    {
+      Engine db(path, 1);
+      auto v = db.get("legacy_doc");
+      require_check(v.size() > 0 && v.get_i64(0, "age") == 33 &&
+                        v.get_str(0, "city") == "NYC",
+                    "Legacy WAL PATCH_I64 / PATCH_STR backward-compatibility broken");
+    }
+    std::filesystem::remove(path);
+  }
+
+  std::cout << "[PASS] Wave 1 P0/P1 Fixes" << std::endl;
+}
+
 int main() {
   try {
+    test_wave1_optimizations_and_fixes();
     test_manual_buffer();
     test_put_get();
     test_sidecar_metadata();

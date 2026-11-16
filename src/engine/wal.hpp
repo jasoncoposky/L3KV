@@ -1,11 +1,13 @@
 #pragma once
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <functional>
 #include <iostream>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
@@ -48,6 +50,20 @@ struct LogHeader {
   uint32_t payload_len;
 };
 #pragma pack(pop)
+
+namespace detail {
+inline constexpr std::array<uint32_t, 256> kCrc32Table = []() constexpr noexcept {
+  std::array<uint32_t, 256> table{};
+  for (uint32_t i = 0; i < 256; ++i) {
+    uint32_t c = i;
+    for (int j = 0; j < 8; ++j) {
+      c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+    }
+    table[i] = c;
+  }
+  return table;
+}();
+} // namespace detail
 
 class WriteAheadLog {
   struct FileHandle {
@@ -94,19 +110,21 @@ class WriteAheadLog {
   std::atomic<int> last_error_code_{0};
 
   static uint32_t compute_crc(uint8_t op, std::string_view key,
-                               std::string_view payload) {
-    uint32_t crc = 0xFFFFFFFF;
-    auto process = [&](const void *data, size_t len) {
-      const uint8_t *p = (const uint8_t *)data;
-      for (size_t i = 0; i < len; i++) {
-        crc ^= p[i];
-        for (int j = 0; j < 8; j++)
-          crc = (crc >> 1) ^ (0xEDB88320 & (-(crc & 1)));
+                              std::string_view payload) noexcept {
+    uint32_t crc = 0xFFFFFFFFu;
+    auto process = [&](const void *data, size_t len) noexcept {
+      const auto *p = static_cast<const uint8_t *>(data);
+      for (size_t i = 0; i < len; ++i) {
+        crc = (crc >> 8) ^ detail::kCrc32Table[(crc ^ p[i]) & 0xFFu];
       }
     };
     process(&op, sizeof(op));
-    process(key.data(), key.size());
-    process(payload.data(), payload.size());
+    if (!key.empty()) {
+      process(key.data(), key.size());
+    }
+    if (!payload.empty()) {
+      process(payload.data(), payload.size());
+    }
     return ~crc;
   }
 
@@ -152,59 +170,110 @@ public:
   }
 
   void append(WalOp op, std::string_view key, std::string_view payload) {
-    uint32_t crc = compute_crc((uint8_t)op, key, payload);
+    if (key.size() > UINT16_MAX) {
+      throw std::invalid_argument("WAL key size exceeds UINT16_MAX");
+    }
+    if (payload.size() > UINT32_MAX) {
+      throw std::invalid_argument("WAL payload size exceeds UINT32_MAX");
+    }
+
+    uint32_t crc = compute_crc(static_cast<uint8_t>(op), key, payload);
     size_t total_len = sizeof(LogHeader) + key.size() + payload.size();
 
-    std::vector<uint8_t> buffer(total_len);
-    uint8_t* ptr = buffer.data();
-    
-    LogHeader h{crc, (uint8_t)op, (uint16_t)key.size(), (uint32_t)payload.size()};
+    thread_local std::vector<uint8_t> buffer;
+    buffer.resize(total_len);
+    uint8_t *ptr = buffer.data();
+
+    LogHeader h{crc, static_cast<uint8_t>(op),
+                static_cast<uint16_t>(key.size()),
+                static_cast<uint32_t>(payload.size())};
     std::memcpy(ptr, &h, sizeof(h));
     ptr += sizeof(h);
-    
-    std::memcpy(ptr, key.data(), key.size());
-    ptr += key.size();
-    
-    std::memcpy(ptr, payload.data(), payload.size());
-    
-    write_raw(buffer.data(), buffer.size());
+
+    if (!key.empty()) {
+      std::memcpy(ptr, key.data(), key.size());
+      ptr += key.size();
+    }
+
+    if (!payload.empty()) {
+      std::memcpy(ptr, payload.data(), payload.size());
+    }
+
+    if (!write_raw(buffer.data(), buffer.size())) {
+      throw std::runtime_error("WAL write_raw failed in append");
+    }
+    if (buffer.capacity() > 16ULL * 1024 * 1024 && total_len < 65536) {
+      buffer.clear();
+      buffer.shrink_to_fit();
+    }
   }
 
   void append_batch(const std::vector<BatchOp> &ops) {
     if (ops.empty()) return;
+    if (ops.size() > UINT32_MAX) {
+      throw std::invalid_argument("WAL batch op count exceeds UINT32_MAX");
+    }
 
     size_t payload_size = 4; // count
     for (const auto &op : ops) {
-      payload_size += 1 + 2 + op.key.size() + 4 + op.value.size();
+      if (op.key.size() > UINT16_MAX) {
+        throw std::invalid_argument("WAL batch key size exceeds UINT16_MAX");
+      }
+      if (op.value.size() > UINT32_MAX) {
+        throw std::invalid_argument("WAL batch value size exceeds UINT32_MAX");
+      }
+      size_t entry_size = 1 + 2 + op.key.size() + 4 + op.value.size();
+      if (entry_size > UINT32_MAX - payload_size) {
+        throw std::invalid_argument("WAL batch payload size exceeds UINT32_MAX");
+      }
+      payload_size += entry_size;
     }
 
     size_t total_len = sizeof(LogHeader) + payload_size;
-    std::vector<uint8_t> buffer(total_len);
-    uint8_t* ptr = buffer.data();
-    uint8_t* payload_start = ptr + sizeof(LogHeader);
+    thread_local std::vector<uint8_t> buffer;
+    buffer.resize(total_len);
+    uint8_t *ptr = buffer.data();
+    uint8_t *payload_start = ptr + sizeof(LogHeader);
 
     // Format payload directly
-    uint32_t count = (uint32_t)ops.size();
+    uint32_t count = static_cast<uint32_t>(ops.size());
     std::memcpy(payload_start, &count, 4);
-    uint8_t* p = payload_start + 4;
+    uint8_t *p = payload_start + 4;
 
     for (const auto &op : ops) {
-      *p++ = (uint8_t)op.op;
-      uint16_t klen = (uint16_t)op.key.size();
-      std::memcpy(p, &klen, 2); p += 2;
-      std::memcpy(p, op.key.data(), klen); p += klen;
-      uint32_t vlen = (uint32_t)op.value.size();
-      std::memcpy(p, &vlen, 4); p += 4;
-      std::memcpy(p, op.value.data(), vlen); p += vlen;
+      *p++ = static_cast<uint8_t>(op.op);
+      uint16_t klen = static_cast<uint16_t>(op.key.size());
+      std::memcpy(p, &klen, 2);
+      p += 2;
+      if (klen > 0) {
+        std::memcpy(p, op.key.data(), klen);
+        p += klen;
+      }
+      uint32_t vlen = static_cast<uint32_t>(op.value.size());
+      std::memcpy(p, &vlen, 4);
+      p += 4;
+      if (vlen > 0) {
+        std::memcpy(p, op.value.data(), vlen);
+        p += vlen;
+      }
     }
 
-    std::string_view payload_view((const char*)payload_start, payload_size);
-    uint32_t crc = compute_crc((uint8_t)WalOp::BATCH, "", payload_view);
+    std::string_view payload_view(reinterpret_cast<const char *>(payload_start),
+                                  payload_size);
+    uint32_t crc =
+        compute_crc(static_cast<uint8_t>(WalOp::BATCH), "", payload_view);
 
-    LogHeader h{crc, (uint8_t)WalOp::BATCH, 0, (uint32_t)payload_size};
+    LogHeader h{crc, static_cast<uint8_t>(WalOp::BATCH), 0,
+                static_cast<uint32_t>(payload_size)};
     std::memcpy(ptr, &h, sizeof(h));
 
-    write_raw(buffer.data(), buffer.size());
+    if (!write_raw(buffer.data(), buffer.size())) {
+      throw std::runtime_error("WAL write_raw failed in append_batch");
+    }
+    if (buffer.capacity() > 16ULL * 1024 * 1024 && total_len < 65536) {
+      buffer.clear();
+      buffer.shrink_to_fit();
+    }
   }
 
   using RecoverCallback =

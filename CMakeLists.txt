@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(L3KV VERSION 1.0 LANGUAGES CXX C)
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
@@ -32,7 +36,7 @@ set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(zstd)
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/_deps/zstd-src/lib)
+include_directories(${zstd_SOURCE_DIR}/lib)
 
 FetchContent_Declare(
   xxhash
@@ -42,6 +46,7 @@ FetchContent_Declare(
 )
 set(XXHASH_BUILD_ALIASES ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(xxhash)
+include_directories(${xxhash_SOURCE_DIR})
 FetchContent_Declare(
   concurrentqueue
   GIT_REPOSITORY https://github.com/cameron314/concurrentqueue.git
@@ -90,20 +95,21 @@ target_include_directories(l3kv_engine PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../lib/lite3-cpp/include
     ${concurrentqueue_SOURCE_DIR}
     "${CMAKE_CURRENT_SOURCE_DIR}/../lib/boost_1_89_0"
-    ${CMAKE_CURRENT_SOURCE_DIR}/_deps/zstd-src/lib
+    ${zstd_SOURCE_DIR}/lib
+    ${xxhash_SOURCE_DIR}
 )
 target_link_libraries(l3kv_engine PUBLIC
     lite3-cpp
     libzstd_static
     xxhash
 )
+if(NOT MSVC)
+    target_compile_options(l3kv_engine PUBLIC $<$<CONFIG:Release,RelWithDebInfo>:-O3>)
+endif()
 
 add_executable(l3svc
     src/main.cpp
     src/zmq/zmq_server.cpp
-    src/observability/simple_metrics.cpp
-    src/engine/clock.cpp
-    src/engine/mesh.cpp
 )
 
 target_include_directories(l3svc PRIVATE
@@ -149,7 +155,7 @@ target_include_directories(test_wal PRIVATE src)
 target_link_libraries(test_wal PRIVATE Threads::Threads l3kv_engine)
 add_test(NAME test_wal COMMAND test_wal)
 
-add_executable(test_store src/tests_cpp/test_store.cpp src/engine/clock.cpp)
+add_executable(test_store src/tests_cpp/test_store.cpp)
 target_include_directories(test_store PRIVATE src)
 target_link_libraries(test_store PRIVATE Threads::Threads l3kv_engine)
 add_test(NAME test_store COMMAND test_store)
@@ -176,7 +182,7 @@ target_link_libraries(test_phase2 PRIVATE
 add_test(NAME test_phase2 COMMAND test_phase2)
 
 add_executable(test_merkle src/tests_cpp/test_merkle.cpp)
-target_include_directories(test_merkle PRIVATE src ${CMAKE_CURRENT_SOURCE_DIR}/_deps/xxhash-src)
+target_include_directories(test_merkle PRIVATE src ${xxhash_SOURCE_DIR})
 target_link_libraries(test_merkle PRIVATE Threads::Threads xxhash)
 add_test(NAME test_merkle COMMAND test_merkle)
 
@@ -250,11 +256,11 @@ target_link_libraries(bench_ycsb PRIVATE
     lite3-cpp
 )
 
-add_executable(engine_bench src/tests_cpp/engine_bench.cpp src/engine/clock.cpp)
+add_executable(engine_bench src/tests_cpp/engine_bench.cpp)
 target_include_directories(engine_bench PRIVATE src)
 target_link_libraries(engine_bench PRIVATE Threads::Threads l3kv_engine)
 
-add_executable(bench_engine_threaded src/tests_cpp/bench_engine_threaded.cpp src/engine/clock.cpp)
+add_executable(bench_engine_threaded src/tests_cpp/bench_engine_threaded.cpp)
 target_include_directories(bench_engine_threaded PRIVATE src)
 target_link_libraries(bench_engine_threaded PRIVATE Threads::Threads l3kv_engine)
 
