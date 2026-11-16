@@ -36,6 +36,7 @@ class HybridLogicalClock {
   int64_t max_wall_time_{0};
   uint32_t max_logical_{0};
   uint32_t node_id_{0};
+  int64_t last_warn_phys_{0};
 
 public:
   explicit HybridLogicalClock(uint32_t node_id) : node_id_(node_id) {}
@@ -53,6 +54,10 @@ public:
   // (failure, retry). If successful, max_logical_ is incremented by 'count'.
   int64_t reserve_logical(int64_t for_phys_time, int count);
 
+  // Reserve a batch of logical ticks at effective_wall = max(min_phys_time, phys_now, max_wall_time_).
+  bool reserve_batch(int64_t min_phys_time, uint32_t count,
+                     int64_t &out_wall_time, uint32_t &out_start_logical);
+
   uint32_t get_node_id() const { return node_id_; }
 };
 
@@ -68,7 +73,11 @@ public:
       : global_clock_(global) {}
 
   Timestamp now();
-  void update(const Timestamp &incoming) { global_clock_->update(incoming); }
+  void update(const Timestamp &incoming) {
+    global_clock_->update(incoming);
+    cached_logical_next_ = 0;
+    cached_logical_end_ = 0;
+  }
 };
 
 } // namespace l3kv

@@ -52,11 +52,54 @@ void test_logical_increment() {
   std::cout << "[PASS] Logical Increment" << std::endl;
 }
 
+void test_thread_local_future_skew_no_spin() {
+  HybridLogicalClock clock(1);
+  Timestamp base = clock.now();
+  Timestamp future_remote{base.wall_time + 3600LL * 1000000LL, 5, 2};
+  clock.update(future_remote);
+
+  constexpr int THREADS = 4;
+  constexpr int OPS_PER_THREAD = 500;
+  std::vector<std::vector<Timestamp>> per_thread(THREADS);
+  auto t0 = std::chrono::steady_clock::now();
+
+  std::vector<std::thread> workers;
+  for (int t = 0; t < THREADS; ++t) {
+    workers.emplace_back([&, t]() {
+      ThreadLocalClock local(&clock);
+      per_thread[t].reserve(OPS_PER_THREAD);
+      for (int i = 0; i < OPS_PER_THREAD; ++i) {
+        per_thread[t].push_back(local.now());
+      }
+    });
+  }
+  for (auto &w : workers) {
+    w.join();
+  }
+
+  auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+  assert(elapsed_ms < 1000 &&
+         "ThreadLocalClock::now() spun/stalled under +1h future clock skew");
+
+  for (int t = 0; t < THREADS; ++t) {
+    Timestamp prev = future_remote;
+    for (const auto &ts : per_thread[t]) {
+      assert(ts > prev && "ThreadLocalClock must be strictly monotonic above future skew");
+      prev = ts;
+    }
+  }
+  std::cout << "[PASS] ThreadLocalClock +1h Future Skew No-Spin (" << elapsed_ms
+            << "ms)" << std::endl;
+}
+
 int main() {
   try {
     test_monotonicity();
     test_causality_receive();
     test_logical_increment();
+    test_thread_local_future_skew_no_spin();
     std::cout << "All Clock Tests Passed!" << std::endl;
   } catch (const std::exception &e) {
     std::cerr << "Test Failed: " << e.what() << std::endl;

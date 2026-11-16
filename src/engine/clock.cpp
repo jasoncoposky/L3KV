@@ -27,11 +27,10 @@ Timestamp HybridLogicalClock::now() {
     int64_t diff = max_wall_time_ - phys_now;
     if (diff > 5000000) { // 5 seconds
       // Only log periodically to avoid spamming
-      static int64_t last_warn = 0;
-      if (phys_now - last_warn > 5000000) {
+      if (last_warn_phys_ == 0 || phys_now - last_warn_phys_ > 5000000) {
         std::cerr << "[HLC] WARNING: Physical clock lagging logical clock by "
                   << (diff / 1000) << "ms. (System clock moved backwards?)\n";
-        last_warn = phys_now;
+        last_warn_phys_ = phys_now;
       }
     }
 
@@ -104,47 +103,63 @@ int64_t HybridLogicalClock::reserve_logical(int64_t for_phys_time, int count) {
   return start_logical;
 }
 
+bool HybridLogicalClock::reserve_batch(int64_t min_phys_time, uint32_t count,
+                                       int64_t &out_wall_time,
+                                       uint32_t &out_start_logical) {
+  if (count == 0) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(mx_);
+  int64_t effective_wall =
+      std::max({min_phys_time, get_physical_time(), max_wall_time_});
+
+  if (effective_wall > max_wall_time_) {
+    max_wall_time_ = effective_wall;
+    max_logical_ = 0;
+  }
+
+  if (UINT32_MAX - max_logical_ < count) {
+    return false;
+  }
+
+  out_wall_time = max_wall_time_;
+  out_start_logical = max_logical_ + 1;
+  max_logical_ += count;
+  return true;
+}
+
 Timestamp ThreadLocalClock::now() {
   int64_t phys_now = get_physical_time();
 
-  // 1. Try to use batch
-  if (phys_now == cached_phys_time_) {
+  // 1. Serve from cached batch whenever physical time has not surpassed cached_phys_time_
+  //    (covers both same-microsecond bursts and skewed max_wall_time_ > phys_now)
+  if (phys_now <= cached_phys_time_) {
     if (cached_logical_next_ < cached_logical_end_) {
       return {cached_phys_time_, cached_logical_next_++,
               global_clock_->get_node_id()};
     }
-  } else if (phys_now > cached_phys_time_) {
-    // Time moved forward, reset batch
+  } else {
     cached_phys_time_ = phys_now;
     cached_logical_next_ = 0;
     cached_logical_end_ = 0;
   }
 
-  // 2. Refill batch
-  const int BATCH_SIZE = 50;
-  while (true) {
-    // Attempt reservation
-    int64_t start_logical =
-        global_clock_->reserve_logical(phys_now, BATCH_SIZE);
-    if (start_logical >= 0) {
-      cached_phys_time_ = phys_now; // Confirmed by global clock
-      cached_logical_next_ = static_cast<uint32_t>(start_logical);
-      cached_logical_end_ = cached_logical_next_ + BATCH_SIZE;
-      return {cached_phys_time_, cached_logical_next_++,
-              global_clock_->get_node_id()};
-    }
-
-    // Reservation failed.
-    // Ensure we don't spin too tight if clock is fighting
-    std::this_thread::yield();
-
-    int64_t next_phys = get_physical_time();
-    if (next_phys == phys_now) {
-      // Force fallback to global if stuck
-      return global_clock_->now();
-    }
-    phys_now = next_phys;
+  // 2. Refill batch at effective_wall = max(phys_now, max_wall_time_) without spinning
+  constexpr uint32_t BATCH_SIZE = 50;
+  int64_t batch_wall = 0;
+  uint32_t start_logical = 0;
+  if (global_clock_->reserve_batch(phys_now, BATCH_SIZE, batch_wall,
+                                   start_logical)) {
+    cached_phys_time_ = batch_wall;
+    cached_logical_next_ = start_logical;
+    cached_logical_end_ = start_logical + BATCH_SIZE;
+    return {cached_phys_time_, cached_logical_next_++,
+            global_clock_->get_node_id()};
   }
+
+  cached_logical_next_ = 0;
+  cached_logical_end_ = 0;
+  return global_clock_->now();
 }
 
 } // namespace l3kv

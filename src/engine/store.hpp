@@ -365,9 +365,13 @@ public:
     }
   }
 
-  bool set_int(std::string_view key, int64_t val, ZstdManager *zstd) {
+  bool set_int(std::string_view key, int64_t val, ZstdManager *zstd,
+               bool recompress = true) {
     if (compressed_) {
       decompress(zstd);
+    }
+    if (compressed_) {
+      return false;
     }
     if (buf_.size() == 0) {
       buf_.init_object();
@@ -375,15 +379,19 @@ public:
     buf_.set_i64(0, lite3cpp::HashedKey(key), val);
     original_size_ = static_cast<uint32_t>(buf_.size());
     content_hash_ = buf_.size() > 0 ? XXH3_64bits(buf_.data(), buf_.size()) : 0;
-    if (zstd && buf_.size() >= 512) {
+    if (recompress && zstd && buf_.size() >= 512) {
       compress(zstd);
     }
     return true;
   }
 
-  bool set_str(std::string_view key, std::string_view val, ZstdManager *zstd) {
+  bool set_str(std::string_view key, std::string_view val, ZstdManager *zstd,
+               bool recompress = true) {
     if (compressed_) {
       decompress(zstd);
+    }
+    if (compressed_) {
+      return false;
     }
     if (buf_.size() == 0) {
       buf_.init_object();
@@ -391,7 +399,7 @@ public:
     buf_.set_str(0, lite3cpp::HashedKey(key), val);
     original_size_ = static_cast<uint32_t>(buf_.size());
     content_hash_ = buf_.size() > 0 ? XXH3_64bits(buf_.data(), buf_.size()) : 0;
-    if (zstd && buf_.size() >= 512) {
+    if (recompress && zstd && buf_.size() >= 512) {
       compress(zstd);
     }
     return true;
@@ -473,7 +481,7 @@ public:
         return XXH3_64bits(tag.data(), tag.size()) % SHARDS;
       }
     }
-    if (key.size() > 5 && key.ends_with(":meta")) {
+    if (key.size() >= 5 && key.ends_with(":meta")) {
       std::string_view base = key.substr(0, key.size() - 5);
       return XXH3_64bits(base.data(), base.size()) % SHARDS;
     }
@@ -756,7 +764,9 @@ private:
     }
 
     const bool is_meta = key.ends_with(":meta");
-    new_blob->set_int(field, val, is_meta ? nullptr : zstd_manager_.get());
+    if (!new_blob->set_int(field, val, zstd_manager_.get(), !is_meta)) {
+      return;
+    }
     const uint64_t new_h = hash_blob(new_blob);
     if (found) {
       it->second = std::move(new_blob);
@@ -786,7 +796,9 @@ private:
     }
 
     const bool is_meta = key.ends_with(":meta");
-    new_blob->set_str(field, val, is_meta ? nullptr : zstd_manager_.get());
+    if (!new_blob->set_str(field, val, zstd_manager_.get(), !is_meta)) {
+      return;
+    }
     const uint64_t new_h = hash_blob(new_blob);
     if (found) {
       it->second = std::move(new_blob);
@@ -1278,6 +1290,7 @@ public:
     };
 
     std::vector<PreparedPut> prepared;
+    std::array<bool, SHARDS> touched{};
     size_t root = 0;
     for (auto it = batch.begin(root), end = batch.end(root); it != end; ++it) {
       std::string_view key_sv = it->key;
@@ -1303,55 +1316,67 @@ public:
       const bool is_meta = key_sv.ends_with(":meta");
       auto vblob = std::make_shared<Blob>(val_sv, zstd_manager_.get(), nullptr,
                                           !is_meta);
-      auto now = next_timestamp();
-      auto &mbuf = format_meta_tl(now, false);
-      auto mblob = make_meta_blob(mbuf);
       std::string mkey_s(KeyBuilder::meta_key(key_sv));
       const size_t k_idx = get_routing_shard(key_sv);
       const size_t m_idx = get_routing_shard(mkey_s);
+      touched[k_idx] = true;
+      touched[m_idx] = true;
 
       prepared.push_back({key_sv, val_sv, std::move(mkey_s), std::move(vblob),
-                          std::move(mblob), k_idx, m_idx});
+                          nullptr, k_idx, m_idx});
     }
 
     if (prepared.empty()) {
       return;
     }
 
-    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
+    struct PendingSysHook {
+      std::string_view key;
+      std::string_view val;
+      std::shared_ptr<const Blob> blob;
+    };
+    std::vector<PendingSysHook> sys_hooks;
 
-    std::vector<BatchOp> wal_batch;
-    wal_batch.reserve(prepared.size() * 2);
-    std::array<bool, SHARDS> touched{};
-    for (const auto &item : prepared) {
-      wal_batch.push_back({WalOp::PUT, item.key, item.val});
-      std::string_view mval_sv(
-          reinterpret_cast<const char *>(item.meta_blob->buf_.data()),
-          item.meta_blob->buf_.size());
-      wal_batch.push_back({WalOp::PUT, item.mkey, mval_sv});
-      touched[item.k_shard] = true;
-      touched[item.m_shard] = true;
-    }
+    {
+      std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
 
-    std::vector<std::unique_lock<std::shared_mutex>> shard_locks;
-    shard_locks.reserve(SHARDS);
-    for (size_t i = 0; i < SHARDS; ++i) {
-      if (touched[i]) {
-        shard_locks.emplace_back(shards_[i]->read_mu);
+      std::vector<std::unique_lock<std::shared_mutex>> shard_locks;
+      shard_locks.reserve(SHARDS);
+      for (size_t i = 0; i < SHARDS; ++i) {
+        if (touched[i]) {
+          shard_locks.emplace_back(shards_[i]->read_mu);
+        }
+      }
+
+      std::vector<BatchOp> wal_batch;
+      wal_batch.reserve(prepared.size() * 2);
+      for (auto &item : prepared) {
+        auto now = next_timestamp();
+        auto &mbuf = format_meta_tl(now, false);
+        item.meta_blob = make_meta_blob(mbuf);
+        wal_batch.push_back({WalOp::PUT, item.key, item.val});
+        std::string_view mval_sv(
+            reinterpret_cast<const char *>(item.meta_blob->buf_.data()),
+            item.meta_blob->buf_.size());
+        wal_batch.push_back({WalOp::PUT, item.mkey, mval_sv});
+      }
+
+      wal_->append_batch(wal_batch);
+
+      for (auto &item : prepared) {
+        if (item.key.starts_with("sys:")) {
+          sys_hooks.push_back({item.key, item.val, item.val_blob});
+        }
+        upsert_blob_locked(*shards_[item.k_shard], item.key,
+                           std::move(item.val_blob));
+        upsert_blob_locked(*shards_[item.m_shard], item.mkey,
+                           std::move(item.meta_blob));
       }
     }
 
-    wal_->append_batch(wal_batch);
-
-    for (auto &item : prepared) {
-      const bool is_sys = item.key.starts_with("sys:");
-      std::shared_ptr<const Blob> sys_ref = is_sys ? item.val_blob : nullptr;
-      upsert_blob_locked(*shards_[item.k_shard], item.key,
-                         std::move(item.val_blob));
-      upsert_blob_locked(*shards_[item.m_shard], item.mkey,
-                         std::move(item.meta_blob));
-      if (is_sys && sys_ref) {
-        apply_system_hooks(item.key, item.val, *sys_ref);
+    for (const auto &sh : sys_hooks) {
+      if (sh.blob) {
+        apply_system_hooks(sh.key, sh.val, *sh.blob);
       }
     }
   }
@@ -1375,11 +1400,16 @@ public:
 
       lite3cpp::HashedKey hk(k);
       if (view->compressed_) {
+        if (!zstd_manager_ || !zstd_manager_->get_dict()) {
+          continue;
+        }
         auto slot = res.set_bytes_uninitialized(0, hk, view->original_size_);
         if (!slot.empty()) {
-          zstd_manager_->decompress_into(
-              view->buf_.data(), view->buf_.size(),
-              reinterpret_cast<char *>(slot.data()), slot.size());
+          if (!zstd_manager_->decompress_into(
+                  view->buf_.data(), view->buf_.size(),
+                  reinterpret_cast<char *>(slot.data()), slot.size())) {
+            std::memset(slot.data(), 0, slot.size());
+          }
         }
       } else {
         auto v = view->view();
@@ -1403,31 +1433,50 @@ public:
       return;
     }
 
-    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
-
-    if (!wal_ops.empty() && wal_) {
-      wal_->append_batch(wal_ops);
-    }
+    struct PreparedShardOps {
+      size_t shard_idx;
+      std::vector<std::string> dels;
+      std::vector<std::pair<std::string, std::shared_ptr<Blob>>> puts;
+    };
+    std::vector<PreparedShardOps> prepared_shards;
+    prepared_shards.reserve(shard_mutations.size());
 
     for (auto &[shard_idx, mut] : shard_mutations) {
       if (shard_idx >= SHARDS) {
         continue;
       }
-      std::vector<std::pair<std::string, std::shared_ptr<Blob>>> prepared_puts;
-      prepared_puts.reserve(mut.puts.size());
+      PreparedShardOps pso;
+      pso.shard_idx = shard_idx;
+      pso.dels = std::move(mut.dels);
+      pso.puts.reserve(mut.puts.size());
       for (auto &p : mut.puts) {
         const bool is_meta = p.first.ends_with(":meta");
-        prepared_puts.emplace_back(
+        pso.puts.emplace_back(
             std::move(p.first),
             std::make_shared<Blob>(p.second, zstd_manager_.get(), nullptr,
                                    !is_meta));
       }
-      auto &s = *shards_[shard_idx];
-      std::unique_lock<std::shared_mutex> lock(s.read_mu);
-      for (const auto &d : mut.dels) {
+      prepared_shards.push_back(std::move(pso));
+    }
+
+    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
+
+    std::vector<std::unique_lock<std::shared_mutex>> shard_locks;
+    shard_locks.reserve(prepared_shards.size());
+    for (const auto &pso : prepared_shards) {
+      shard_locks.emplace_back(shards_[pso.shard_idx]->read_mu);
+    }
+
+    if (!wal_ops.empty() && wal_) {
+      wal_->append_batch(wal_ops);
+    }
+
+    for (auto &pso : prepared_shards) {
+      auto &s = *shards_[pso.shard_idx];
+      for (const auto &d : pso.dels) {
         apply_del_locked(s, d);
       }
-      for (auto &[pk, pblob] : prepared_puts) {
+      for (auto &[pk, pblob] : pso.puts) {
         upsert_blob_locked(s, pk, std::move(pblob));
       }
     }

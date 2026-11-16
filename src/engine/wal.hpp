@@ -147,6 +147,9 @@ class WriteAheadLog {
         last_error_code_.store(errno, std::memory_order_relaxed);
         return false;
       }
+      if (n == 0) {
+        return false;
+      }
       ptr += n;
       remaining -= static_cast<size_t>(n);
     }

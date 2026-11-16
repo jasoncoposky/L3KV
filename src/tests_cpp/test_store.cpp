@@ -1111,6 +1111,126 @@ void test_wave1_optimizations_and_fixes() {
     std::filesystem::remove(path);
   }
 
+  // 7. +1h future apply_mutation skew followed by 4-thread db.put() completes < 1s with monotonic :meta
+  {
+    std::string path = "test_wave1_future_skew_puts.wal";
+    std::filesystem::remove(path);
+    {
+      Engine db(path, 1);
+      int64_t now_us = db.get_clock().now().wall_time;
+      Timestamp skew_ts{now_us + 3600LL * 1000000LL, 7, 2};
+      Mutation m_future;
+      m_future.key = "skew_seed";
+      std::string seed_json = R"({"seed":1})";
+      m_future.value.assign(seed_json.begin(), seed_json.end());
+      m_future.timestamp = skew_ts;
+      db.apply_mutation(m_future);
+
+      auto t0 = std::chrono::steady_clock::now();
+      constexpr int THREADS = 4;
+      constexpr int PUTS_PER_THREAD = 80;
+      std::atomic<bool> monotonic_ok{true};
+
+      std::vector<std::thread> workers;
+      for (int t = 0; t < THREADS; ++t) {
+        workers.emplace_back([&, t]() {
+          std::string hot_key = "skew_worker_" + std::to_string(t);
+          Timestamp prev = skew_ts;
+          for (int i = 0; i < PUTS_PER_THREAD; ++i) {
+            db.put(hot_key, "{\"seq\":" + std::to_string(i) + "}");
+            auto meta = db.get(hot_key + ":meta");
+            Timestamp cur{
+                meta.try_get_i64(0, "ts").value_or(0),
+                static_cast<uint32_t>(meta.try_get_i64(0, "l").value_or(0)),
+                static_cast<uint32_t>(meta.try_get_i64(0, "n").value_or(0)),
+            };
+            if (!(cur > prev)) {
+              monotonic_ok.store(false, std::memory_order_relaxed);
+              break;
+            }
+            prev = cur;
+          }
+        });
+      }
+      for (auto &w : workers) {
+        w.join();
+      }
+      auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+      require_check(elapsed_ms < 1000,
+                    "Multi-threaded db.put() after +1h skew took too long (" +
+                        std::to_string(elapsed_ms) + "ms)");
+      require_check(monotonic_ok.load(),
+                    "Non-monotonic :meta HLC timestamps after +1h apply_mutation skew");
+      require_check(db.get_routing_shard("") == db.get_routing_shard(":meta"),
+                    "Empty key \"\" and \":meta\" should co-route");
+    }
+    std::filesystem::remove(path);
+  }
+
+  // 8. Compressed blob patching + corrupt Zstd frame safety in set_int/set_str and batch_get
+  {
+    std::string path = "test_wave1_corrupt_zstd.wal";
+    std::filesystem::remove(path);
+    {
+      Engine db(path, 1);
+
+      // Before Zstd dictionary is active: corrupt compressed blob skipped by batch_get & rejected by set_int/set_str
+      auto bad_blob = std::make_shared<Blob>();
+      const uint8_t garbage[] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02};
+      bad_blob->buf_ = lite3cpp::Buffer(garbage, sizeof(garbage));
+      bad_blob->compressed_ = true;
+      bad_blob->original_size_ = 64;
+
+      Blob copy_for_patch = *bad_blob;
+      require_check(!copy_for_patch.set_int("f", 1, db.get_zstd_manager()),
+                    "Blob::set_int must return false when decompression fails (no dict)");
+      require_check(!copy_for_patch.set_str("f", "v", db.get_zstd_manager()),
+                    "Blob::set_str must return false when decompression fails (no dict)");
+
+      size_t bad_shard = db.get_routing_shard("corrupt_zkey");
+      db.get_shard_by_index(bad_shard).map["corrupt_zkey"] = bad_blob;
+      auto bres_no_dict = db.batch_get({"corrupt_zkey"});
+      require_check(!bres_no_dict.try_get_bytes(0, "corrupt_zkey").has_value(),
+                    "batch_get without active Zstd dict must skip compressed entry cleanly");
+
+      // Train dictionary, verify patching a real compressed blob works, and verify corrupt frame zero-fills slot
+      std::string pad(1600, 'p');
+      for (int i = 0; i < 75; ++i) {
+        db.put("dict_doc_" + std::to_string(i),
+               "{\"cnt\":" + std::to_string(i) + ",\"pad\":\"" + pad + "\"}");
+      }
+      require_check(db.get_zstd_manager()->is_active(), "Expected active Zstd dict");
+
+      db.put("comp_patch_target", "{\"cnt\":10,\"tag\":\"v0\",\"pad\":\"" + pad + "\"}");
+      require_check(db.get_view("comp_patch_target")->compressed_,
+                    "comp_patch_target should be compressed before patch");
+      db.patch_int("comp_patch_target", "cnt", 99);
+      db.patch_str("comp_patch_target", "tag", "v1");
+      auto patched_comp = db.get("comp_patch_target");
+      require_check(patched_comp.get_i64(0, "cnt") == 99 &&
+                        patched_comp.get_str(0, "tag") == "v1",
+                    "Patching compressed blob failed");
+
+      Blob copy_with_dict = *bad_blob;
+      require_check(!copy_with_dict.set_int("f", 1, db.get_zstd_manager()),
+                    "Blob::set_int must return false on corrupt Zstd frame");
+      require_check(!copy_with_dict.set_str("f", "v", db.get_zstd_manager()),
+                    "Blob::set_str must return false on corrupt Zstd frame");
+
+      auto bres_corrupt = db.batch_get({"corrupt_zkey"});
+      auto cbytes = bres_corrupt.try_get_bytes(0, "corrupt_zkey");
+      if (cbytes.has_value()) {
+        for (std::byte b : *cbytes) {
+          require_check(b == std::byte{0},
+                        "batch_get exposed non-zero uninitialized byte on failed Zstd decompression");
+        }
+      }
+    }
+    std::filesystem::remove(path);
+  }
+
   std::cout << "[PASS] Wave 1 P0/P1 Fixes" << std::endl;
 }
 
