@@ -1931,6 +1931,7 @@ public:
     if (shard_idx >= SHARDS || limit == 0) {
       return chunk;
     }
+    chunk.reserve(std::min<size_t>(limit, 256));
 
     auto &s = *shards_[shard_idx];
     std::shared_lock<std::shared_mutex> lock(s.read_mu);
@@ -2024,8 +2025,14 @@ public:
     std::vector<std::pair<std::string, std::string>> results;
     for (size_t i = 0; i < SHARDS; ++i) {
       auto chunk = get_prefix_chunk(prefix, i, start_key, limit);
-      for (auto &entry : chunk) {
-        results.push_back(std::move(entry));
+      if (chunk.empty()) continue;
+      if (results.empty()) {
+        results = std::move(chunk);
+      } else {
+        results.reserve(results.size() + chunk.size());
+        for (auto &entry : chunk) {
+          results.push_back(std::move(entry));
+        }
       }
     }
     std::sort(results.begin(), results.end(),
@@ -2044,6 +2051,7 @@ public:
     if (shard_idx >= SHARDS || limit == 0) {
       return chunk;
     }
+    chunk.reserve(std::min<size_t>(limit, 256));
 
     auto &s = *shards_[shard_idx];
     const int64_t now_us = now_epoch_us();
@@ -2080,8 +2088,14 @@ public:
     std::vector<std::string> results;
     for (size_t i = 0; i < SHARDS; ++i) {
       auto chunk = get_prefix_keys(prefix, i, start_key, limit);
-      for (auto &k : chunk) {
-        results.push_back(std::move(k));
+      if (chunk.empty()) continue;
+      if (results.empty()) {
+        results = std::move(chunk);
+      } else {
+        results.reserve(results.size() + chunk.size());
+        for (auto &k : chunk) {
+          results.push_back(std::move(k));
+        }
       }
     }
     std::sort(results.begin(), results.end());
@@ -2094,14 +2108,67 @@ public:
   std::vector<std::pair<std::string, lite3cpp::Buffer>>
   scan_prefix_kv(const std::string &prefix, const std::string &start_key,
                  size_t limit, uint32_t principal_id = ADMIN_UID) {
-    auto keys = get_prefix_keys_all_shards(prefix, start_key, limit);
-    std::vector<std::pair<std::string, lite3cpp::Buffer>> out;
-    out.reserve(keys.size());
-    for (auto &k : keys) {
-      auto buf = get(k, principal_id);
-      if (buf.size() > 0) {
-        out.emplace_back(std::move(k), std::move(buf));
+    if (limit == 0) {
+      return {};
+    }
+    const int64_t now_us = now_epoch_us();
+    const bool check_acl =
+        (principal_id != INTERNAL_UID && principal_id != ADMIN_UID);
+
+    auto scan_shard = [&](size_t shard_idx,
+                          std::vector<std::pair<std::string, lite3cpp::Buffer>> &out) {
+      auto &s = *shards_[shard_idx];
+      std::shared_lock<std::shared_mutex> lock(s.read_mu);
+      auto it = (!start_key.empty() && start_key >= prefix)
+                    ? s.map.upper_bound(start_key)
+                    : s.map.lower_bound(prefix);
+      size_t added = 0;
+      while (it != s.map.end() && it->first.starts_with(prefix)) {
+        if (!it->second || it->second->buf_.size() == 0 ||
+            it->second->is_expired(now_us) || it->first.ends_with(":meta")) {
+          ++it;
+          continue;
+        }
+        if (check_acl) {
+          auto perm = credentials_->check_permission(principal_id, it->first);
+          if (!(perm & Permission::READ) && !(perm & Permission::ADMIN)) {
+            ++it;
+            continue;
+          }
+        }
+        if (it->second->compressed_) {
+          std::vector<uint8_t> raw(it->second->original_size_);
+          if (!zstd_manager_->decompress_into(it->second->buf_.data(),
+                                              it->second->buf_.size(),
+                                              raw.data(), raw.size())) {
+            ++it;
+            continue;
+          }
+          out.emplace_back(it->first, lite3cpp::Buffer(std::move(raw)));
+        } else {
+          out.emplace_back(it->first, it->second->buf_);
+        }
+        if (++added >= limit) {
+          break;
+        }
+        ++it;
       }
+    };
+
+    std::vector<std::pair<std::string, lite3cpp::Buffer>> out;
+    out.reserve(std::min<size_t>(limit, 256));
+    if (has_complete_routing_tag(prefix)) {
+      scan_shard(get_routing_shard(prefix), out);
+      return out;
+    }
+
+    for (size_t i = 0; i < SHARDS; ++i) {
+      scan_shard(i, out);
+    }
+    std::sort(out.begin(), out.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+    if (out.size() > limit) {
+      out.resize(limit);
     }
     return out;
   }
