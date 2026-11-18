@@ -157,30 +157,32 @@ L3KV supports horizontal scaling via **Consistent Hashing**.
 
 ## ⚡ Performance Metrics
 
-The L3KV core engine is optimized for extremely high concurrency and low latency. The migration to **ZeroMQ** has eliminated the previous HTTP/1.1 bottlenecks, allowing the service layer to match the raw performance of the underlying storage engine.
+The L3KV core engine is optimized for high concurrency, zero-copy `lite3-cpp` reads, and non-blocking WAL compaction.
 
-*   **Raw Engine Throughput:** ~307,000 ops/sec (Read/Update 50/50, 16 threads).
-*   **Service Throughput (ZeroMQ):** ~192,000 ops/sec (Batch 1000).
-*   **Write Latency:** Microsecond-scale document mutations via `lite3-cpp`.
+### Linux (`Release -O3`, 7-Trial `bench_l2_l3kv` & Native Runners)
+
+| Operation / Benchmark | Throughput / Latency | Notes |
+| :--- | :---: | :--- |
+| **`Engine::put` (256B doc, `/dev/shm` WAL)** | **5.55 µs** (**180,061 ops/s**) | **9.41x** faster than initial `52.20 µs` baseline |
+| **`Engine::get` (populated shard map)** | **0.41 µs** (**2,492,601 ops/s**) | **3.00x** faster than `1.23 µs` baseline |
+| **Tagged Prefix Scan (`{zone1}:d:`)** | **207.48 ns** (**4.82 Mops/s**) | Single-shard reverse scan |
+| **Untagged Prefix Scan (`d:` across 8 shards)** | **1,232.23 ns** (**811,752 ops/s**) | Direct `shared_lock` scan |
+| **WAL Compaction (`L2.3_compact_wal`)** | **245.1 MiB/s** (`850.6 ms` p50) | Non-blocking concurrent readers: **7.61 µs (`p50`) / 20.27 µs (`p99`)** |
+| **`engine_bench` (10k async ops)** | **185,582 ops/sec** | `0.0539 s` total |
+| **`bench_engine_threaded` (1.6M ops, 16 threads)** | **91,362 ops/sec** | `17.51 s` total |
 
 
 ## 📊 Benchmarks
 
-### Engine Core (Direct IO)
-Benchmarking the storage engine without HTTP overhead:
-```powershell
-.\Release\bench_engine_threaded.exe
-# Result: ~307k ops/sec (1.6M total ops)
+### Engine Core (Linux Release)
+```bash
+./build_rel/engine_bench
+# Result: 185,582 ops/sec (10k async ops)
+./build_rel/bench_engine_threaded
+# Result: 91,362 ops/sec (1.6M async ops, 16 threads)
 ```
 
-### HTTP Service (Smart Client)
-Benchmarking the full stack over loopback:
-```powershell
-.\Release\bench_ycsb.exe --hosts 127.0.0.1:8080 --ops 100000 --threads 16
-# Result: ~16k ops/sec (HTTP/Network bottlenecked)
-```
-
-### Benchmark Summary (Windows 11, Ryzen 7 5700X, Loopback)
+### Historical Benchmark Summary (Windows 11, Ryzen 7 5700X, Loopback)
 
 | Operation | Throughput / Latency | Description |
 | :--- | :--- | :--- |
@@ -189,4 +191,5 @@ Benchmarking the full stack over loopback:
 | **Distributed Edge (L3KVG)** | **~97,000 ops/sec** | ZeroMQ-coordinated 3-node cluster. |
 | **Zero-Parse Patch** | **< 1 µs** | `lite3-cpp` in-place binary edit. |
 
-**Note on Performance:** The shift to ZeroMQ has successfully bypassed the overhead of Windows networking primitives (HTTP/1.1), allowing L3KV to achieve near-engine-level throughput on standard hardware.
+**Note on Performance:** The shift to ZeroMQ and direct `shared_lock` shard access has bypassed both HTTP/1.1 serialization bottlenecks and WAL-compaction reader stalls, keeping concurrent reader tail latency under **21 µs (`p99`)** even during 215 MiB $\rightarrow$ 112 MiB WAL compaction.
+
