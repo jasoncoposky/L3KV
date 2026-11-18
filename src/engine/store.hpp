@@ -265,8 +265,20 @@ public:
   bool compressed_ = false;
   uint32_t original_size_ = 0;
   uint64_t content_hash_ = 0;
+  int64_t expires_at_us_ = 0;
 
 public:
+  static uint64_t non_zero_hash(const uint8_t *data, size_t len) noexcept {
+    if (len == 0) {
+      return 0;
+    }
+    uint64_t h = XXH3_64bits(data, len);
+    return h == 0 ? 1 : h;
+  }
+
+  bool is_expired(int64_t now_us) const noexcept {
+    return expires_at_us_ > 0 && now_us >= expires_at_us_;
+  }
   Blob() = default;
 
   explicit Blob(std::pmr::memory_resource * /*mr*/, size_t cap = 0)
@@ -340,8 +352,7 @@ public:
         buf_ = lite3cpp::lite3_json::from_json_string(data);
         compressed_ = false;
         original_size_ = static_cast<uint32_t>(buf_.size());
-        content_hash_ =
-            buf_.size() > 0 ? XXH3_64bits(buf_.data(), buf_.size()) : 0;
+        content_hash_ = non_zero_hash(buf_.data(), buf_.size());
         if (zstd && buf_.size() >= 512) {
           zstd->add_sample(std::string_view(
               reinterpret_cast<const char *>(buf_.data()), buf_.size()));
@@ -357,7 +368,7 @@ public:
                             data.size());
     compressed_ = false;
     original_size_ = static_cast<uint32_t>(buf_.size());
-    content_hash_ = buf_.size() > 0 ? XXH3_64bits(buf_.data(), buf_.size()) : 0;
+    content_hash_ = non_zero_hash(buf_.data(), buf_.size());
     if (zstd && buf_.size() >= 512) {
       zstd->add_sample(std::string_view(
           reinterpret_cast<const char *>(buf_.data()), buf_.size()));
@@ -511,8 +522,15 @@ private:
     return tl.clock.now();
   }
 
+  static int64_t now_epoch_us() noexcept {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+  }
+
   static lite3cpp::Buffer &format_meta_tl(const Timestamp &ts,
-                                          bool tombstone = false) {
+                                          bool tombstone = false,
+                                          int64_t expires_at_us = 0) {
     using namespace lite3cpp::literals;
     thread_local lite3cpp::Buffer tl_mbuf;
     tl_mbuf.clear();
@@ -523,6 +541,9 @@ private:
     tl_mbuf.set_i64(0, "n"_hk, ts.node_id);
     if (tombstone) {
       tl_mbuf.set_bool(0, "tombstone"_hk, true);
+    }
+    if (expires_at_us > 0) {
+      tl_mbuf.set_i64(0, "exp"_hk, expires_at_us);
     }
     return tl_mbuf;
   }
@@ -877,6 +898,16 @@ public:
   void apply_put(std::string_view key, std::string_view json_body) {
     const bool is_meta = key.ends_with(":meta");
     const bool is_sys = key.starts_with("sys:");
+    int64_t recovered_exp = 0;
+    if (is_meta && key.size() > 5) {
+      using namespace lite3cpp::literals;
+      auto view_buf = lite3cpp::Buffer::from_view(
+          reinterpret_cast<const uint8_t *>(json_body.data()),
+          json_body.size());
+      if (auto exp = view_buf.try_get_i64(0, "exp"_hk); exp && *exp > 0) {
+        recovered_exp = *exp;
+      }
+    }
     auto new_blob = std::make_shared<Blob>(json_body, zstd_manager_.get(),
                                            nullptr, !is_meta);
     std::shared_ptr<const Blob> sys_ref;
@@ -888,6 +919,17 @@ public:
     {
       std::unique_lock<std::shared_mutex> lock(s.read_mu);
       upsert_blob_locked(s, key, std::move(new_blob));
+    }
+    if (recovered_exp > 0) {
+      std::string_view base = key.substr(0, key.size() - 5);
+      auto &bs = get_shard(base);
+      std::unique_lock<std::shared_mutex> lock(bs.read_mu);
+      if (auto it = bs.map.find(base);
+          it != bs.map.end() && it->second && it->second->buf_.size() > 0) {
+        auto updated = std::make_shared<Blob>(*it->second);
+        updated->expires_at_us_ = recovered_exp;
+        it->second = std::move(updated);
+      }
     }
     if (is_sys && sys_ref) {
       apply_system_hooks(key, json_body, *sys_ref);
@@ -1064,6 +1106,9 @@ public:
     auto &s = *shards_[h];
     std::shared_lock<std::shared_mutex> lock(s.read_mu);
     if (auto it = s.map.find(key); it != s.map.end()) {
+      if (it->second && it->second->is_expired(now_epoch_us())) {
+        return nullptr;
+      }
       return it->second;
     }
     return nullptr;
@@ -1124,8 +1169,14 @@ public:
     return view->buf_;
   }
 
+  struct CasResult {
+    bool ok{false};
+    uint64_t new_hash{0};
+    uint64_t actual_hash{0};
+  };
+
   void put(std::string key, std::string json_body,
-           uint32_t principal_id = ADMIN_UID) {
+           uint32_t principal_id = ADMIN_UID, int64_t ttl_ms = 0) {
     if (principal_id != INTERNAL_UID && principal_id != ADMIN_UID) {
       auto perm = credentials_->check_permission(principal_id, key);
       if (!(perm & Permission::WRITE) && !(perm & Permission::ADMIN)) {
@@ -1137,6 +1188,9 @@ public:
     const bool is_sys = key.starts_with("sys:");
     auto new_blob = std::make_shared<Blob>(json_body, zstd_manager_.get(),
                                            nullptr, !is_meta);
+    const int64_t expires_at_us =
+        (ttl_ms > 0) ? (now_epoch_us() + ttl_ms * 1000LL) : 0;
+    new_blob->expires_at_us_ = expires_at_us;
     std::shared_ptr<const Blob> sys_ref;
     if (is_sys) {
       sys_ref = new_blob;
@@ -1152,7 +1206,7 @@ public:
       ShardPairLock slk(shards_, k_idx, m_idx);
 
       auto now = next_timestamp();
-      auto &mbuf = format_meta_tl(now, false);
+      auto &mbuf = format_meta_tl(now, false, expires_at_us);
       std::string_view meta_sv(reinterpret_cast<const char *>(mbuf.data()),
                                mbuf.size());
 
@@ -1170,6 +1224,73 @@ public:
     if (is_sys && sys_ref) {
       apply_system_hooks(key, json_body, *sys_ref);
     }
+  }
+
+  CasResult cas_put(std::string key, std::string payload,
+                    uint64_t expected_hash, uint32_t principal_id = ADMIN_UID,
+                    int64_t ttl_ms = 0) {
+    if (principal_id != INTERNAL_UID && principal_id != ADMIN_UID) {
+      auto perm = credentials_->check_permission(principal_id, key);
+      if (!(perm & Permission::WRITE) && !(perm & Permission::ADMIN)) {
+        throw std::runtime_error("Unauthorized: Access Denied for key " + key);
+      }
+    }
+
+    const bool is_meta = key.ends_with(":meta");
+    const bool is_sys = key.starts_with("sys:");
+    auto new_blob = std::make_shared<Blob>(payload, zstd_manager_.get(),
+                                           nullptr, !is_meta);
+    const int64_t now_us = now_epoch_us();
+    const int64_t expires_at_us =
+        (ttl_ms > 0) ? (now_us + ttl_ms * 1000LL) : 0;
+    new_blob->expires_at_us_ = expires_at_us;
+    const uint64_t new_hash = new_blob->content_hash();
+
+    std::shared_ptr<const Blob> sys_ref;
+    if (is_sys) {
+      sys_ref = new_blob;
+    }
+
+    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
+
+    std::string_view mkey_v = KeyBuilder::meta_key(key);
+    const size_t k_idx = get_routing_shard(key);
+    const size_t m_idx = get_routing_shard(mkey_v);
+
+    {
+      ShardPairLock slk(shards_, k_idx, m_idx);
+
+      auto &ks = *shards_[k_idx];
+      uint64_t actual = 0;
+      if (auto it = ks.map.find(key);
+          it != ks.map.end() && it->second && it->second->buf_.size() > 0 &&
+          !it->second->is_expired(now_us)) {
+        actual = it->second->content_hash();
+      }
+      if (actual != expected_hash) {
+        return {false, 0, actual};
+      }
+
+      auto now = next_timestamp();
+      auto &mbuf = format_meta_tl(now, false, expires_at_us);
+      std::string_view meta_sv(reinterpret_cast<const char *>(mbuf.data()),
+                               mbuf.size());
+
+      thread_local std::vector<BatchOp> batch;
+      batch.clear();
+      batch.push_back({WalOp::PUT, key, payload});
+      batch.push_back({WalOp::PUT, mkey_v, meta_sv});
+      wal_->append_batch(batch);
+
+      auto meta_blob = make_meta_blob(mbuf);
+      upsert_blob_locked(ks, key, std::move(new_blob));
+      upsert_blob_locked(*shards_[m_idx], mkey_v, std::move(meta_blob));
+    }
+
+    if (is_sys && sys_ref) {
+      apply_system_hooks(key, payload, *sys_ref);
+    }
+    return {true, new_hash, expected_hash};
   }
 
   void patch_int(std::string key, std::string field, int64_t val,
@@ -1553,7 +1674,9 @@ public:
   void flush() { wal_->flush(); }
 
   bool compact_wal_unlocked(
-      uint64_t tombstone_ttl_ms = 24ULL * 3600ULL * 1000ULL) {
+      uint64_t tombstone_ttl_ms = 24ULL * 3600ULL * 1000ULL,
+      std::vector<std::shared_lock<std::shared_mutex>> *active_read_locks =
+          nullptr) {
     if (!wal_) {
       return false;
     }
@@ -1635,11 +1758,21 @@ public:
         });
 
     if (ok) {
-      for (const auto &de : deferred_erasures) {
-        if (de.hash != 0) {
-          merkle_.apply_delta(de.it->first, de.hash);
+      if (!deferred_erasures.empty()) {
+        std::vector<std::unique_lock<std::shared_mutex>> write_locks;
+        if (active_read_locks != nullptr) {
+          active_read_locks->clear();
+          write_locks.reserve(SHARDS);
+          for (size_t i = 0; i < SHARDS; ++i) {
+            write_locks.emplace_back(shards_[i]->read_mu);
+          }
         }
-        shards_[de.shard]->map.erase(de.it);
+        for (const auto &de : deferred_erasures) {
+          if (de.hash != 0) {
+            merkle_.apply_delta(de.it->first, de.hash);
+          }
+          shards_[de.shard]->map.erase(de.it);
+        }
       }
       std::fprintf(stderr,
                    "[WAL COMPACT] Compacted kv.wal from %llu bytes (%zu ops) "
@@ -1657,12 +1790,12 @@ public:
     }
     std::unique_lock<std::shared_mutex> comp_lk(compaction_mu_);
     wait_all_shards();
-    std::vector<std::unique_lock<std::shared_mutex>> locks;
-    locks.reserve(SHARDS);
+    std::vector<std::shared_lock<std::shared_mutex>> read_locks;
+    read_locks.reserve(SHARDS);
     for (size_t i = 0; i < SHARDS; ++i) {
-      locks.emplace_back(shards_[i]->read_mu);
+      read_locks.emplace_back(shards_[i]->read_mu);
     }
-    return compact_wal_unlocked(tombstone_ttl_ms);
+    return compact_wal_unlocked(tombstone_ttl_ms, &read_locks);
   }
 
   void wait_all_shards() {
@@ -1827,13 +1960,14 @@ public:
     }
 
     auto &s = *shards_[shard_idx];
+    const int64_t now_us = now_epoch_us();
     std::shared_lock<std::shared_mutex> lock(s.read_mu);
     auto it = (!start_key.empty() && start_key >= prefix)
                   ? s.map.upper_bound(start_key)
                   : s.map.lower_bound(prefix);
     while (it != s.map.end() && it->first.starts_with(prefix)) {
       if (!it->second || it->second->buf_.size() == 0 ||
-          it->first.ends_with(":meta")) {
+          it->second->is_expired(now_us) || it->first.ends_with(":meta")) {
         ++it;
         continue;
       }
@@ -1869,6 +2003,69 @@ public:
       results.resize(limit);
     }
     return results;
+  }
+
+  std::vector<std::pair<std::string, lite3cpp::Buffer>>
+  scan_prefix_kv(const std::string &prefix, const std::string &start_key,
+                 size_t limit, uint32_t principal_id = ADMIN_UID) {
+    auto keys = get_prefix_keys_all_shards(prefix, start_key, limit);
+    std::vector<std::pair<std::string, lite3cpp::Buffer>> out;
+    out.reserve(keys.size());
+    for (auto &k : keys) {
+      auto buf = get(k, principal_id);
+      if (buf.size() > 0) {
+        out.emplace_back(std::move(k), std::move(buf));
+      }
+    }
+    return out;
+  }
+
+  size_t sweep_expired_keys(size_t max_per_shard = 256) {
+    const int64_t now_us = now_epoch_us();
+    std::vector<std::string> candidates;
+    for (size_t i = 0; i < SHARDS; ++i) {
+      auto &s = *shards_[i];
+      std::shared_lock<std::shared_mutex> lock(s.read_mu);
+      size_t count = 0;
+      for (const auto &[k, blob] : s.map) {
+        if (blob && blob->buf_.size() > 0 && !k.ends_with(":meta") &&
+            blob->is_expired(now_us)) {
+          candidates.push_back(k);
+          if (++count >= max_per_shard) {
+            break;
+          }
+        }
+      }
+    }
+
+    size_t swept = 0;
+    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
+    for (const auto &key : candidates) {
+      std::string_view mkey_v = KeyBuilder::meta_key(key);
+      const size_t k_idx = get_routing_shard(key);
+      const size_t m_idx = get_routing_shard(mkey_v);
+      ShardPairLock slk(shards_, k_idx, m_idx);
+      auto &ks = *shards_[k_idx];
+      auto it = ks.map.find(key);
+      if (it == ks.map.end() || !it->second || it->second->buf_.size() == 0 ||
+          !it->second->is_expired(now_us)) {
+        continue;
+      }
+      auto now = next_timestamp();
+      auto &mbuf = format_meta_tl(now, true);
+      std::string_view meta_sv(reinterpret_cast<const char *>(mbuf.data()),
+                               mbuf.size());
+      thread_local std::vector<BatchOp> batch;
+      batch.clear();
+      batch.push_back({WalOp::DELETE_, key, ""});
+      batch.push_back({WalOp::PUT, mkey_v, meta_sv});
+      wal_->append_batch(batch);
+
+      apply_del_locked(ks, key);
+      upsert_blob_locked(*shards_[m_idx], mkey_v, make_meta_blob(mbuf));
+      ++swept;
+    }
+    return swept;
   }
 };
 
