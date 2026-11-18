@@ -104,6 +104,17 @@ class WriteAheadLog {
   std::string path_;
   FileHandle file_;
   mutable std::mutex write_mutex_;
+  std::mutex queue_mu_;
+  struct PendingWrite {
+    const void *data;
+    size_t len;
+    std::atomic<bool> done{false};
+    bool ok{false};
+    PendingWrite *next{nullptr};
+  };
+  PendingWrite *gc_head_{nullptr};
+  PendingWrite *gc_tail_{nullptr};
+  bool gc_active_{false};
   std::atomic<size_t> bytes_written_{0};
   std::atomic<size_t> bytes_read_{0};
   std::atomic<size_t> last_recovered_ops_{0};
@@ -128,9 +139,8 @@ class WriteAheadLog {
     return ~crc;
   }
 
-  bool write_raw(const void* data, size_t len) {
+  bool write_raw_unlocked(const void* data, size_t len) {
     if (!data || len == 0) return true;
-    std::lock_guard<std::mutex> lock(write_mutex_);
 #ifdef _WIN32
     DWORD written = 0;
     if (!WriteFile(file_.h, data, static_cast<DWORD>(len), &written, NULL) || written != len) {
@@ -156,6 +166,104 @@ class WriteAheadLog {
 #endif
     bytes_written_.fetch_add(len, std::memory_order_relaxed);
     return true;
+  }
+
+  bool write_raw(const void* data, size_t len) {
+    if (!data || len == 0) return true;
+    PendingWrite self{data, len};
+    {
+      std::lock_guard<std::mutex> qlk(queue_mu_);
+      if (gc_active_) {
+        if (gc_tail_) {
+          gc_tail_->next = &self;
+        } else {
+          gc_head_ = &self;
+        }
+        gc_tail_ = &self;
+        // Wait outside queue_mu_
+      } else {
+        gc_active_ = true;
+        goto become_leader;
+      }
+    }
+    self.done.wait(false, std::memory_order_acquire);
+    return self.ok;
+
+  become_leader:
+    bool self_ok = false;
+    {
+      std::lock_guard<std::mutex> wlk(write_mutex_);
+      // Drain any followers that arrived while we acquired write_mutex_
+      PendingWrite *batch = nullptr;
+      {
+        std::lock_guard<std::mutex> qlk(queue_mu_);
+        batch = gc_head_;
+        gc_head_ = nullptr;
+        gc_tail_ = nullptr;
+      }
+
+      if (!batch) {
+        self_ok = write_raw_unlocked(data, len);
+      } else {
+        thread_local std::vector<uint8_t> coalesce_buf;
+        coalesce_buf.clear();
+        coalesce_buf.insert(coalesce_buf.end(),
+                            static_cast<const uint8_t *>(data),
+                            static_cast<const uint8_t *>(data) + len);
+        for (PendingWrite *cur = batch; cur; cur = cur->next) {
+          const auto *p = static_cast<const uint8_t *>(cur->data);
+          coalesce_buf.insert(coalesce_buf.end(), p, p + cur->len);
+        }
+        self_ok = write_raw_unlocked(coalesce_buf.data(), coalesce_buf.size());
+        if (coalesce_buf.capacity() > 16ULL * 1024 * 1024 &&
+            coalesce_buf.size() < 65536) {
+          coalesce_buf.clear();
+          coalesce_buf.shrink_to_fit();
+        }
+        while (batch) {
+          PendingWrite *next = batch->next;
+          batch->ok = self_ok;
+          batch->done.store(true, std::memory_order_release);
+          batch->done.notify_one();
+          batch = next;
+        }
+      }
+
+      // Drain any remaining followers that arrived during the syscall
+      for (;;) {
+        PendingWrite *more = nullptr;
+        {
+          std::lock_guard<std::mutex> qlk(queue_mu_);
+          more = gc_head_;
+          gc_head_ = nullptr;
+          gc_tail_ = nullptr;
+          if (!more) {
+            gc_active_ = false;
+            break;
+          }
+        }
+        thread_local std::vector<uint8_t> coalesce_buf;
+        coalesce_buf.clear();
+        for (PendingWrite *cur = more; cur; cur = cur->next) {
+          const auto *p = static_cast<const uint8_t *>(cur->data);
+          coalesce_buf.insert(coalesce_buf.end(), p, p + cur->len);
+        }
+        bool batch_ok = write_raw_unlocked(coalesce_buf.data(), coalesce_buf.size());
+        if (coalesce_buf.capacity() > 16ULL * 1024 * 1024 &&
+            coalesce_buf.size() < 65536) {
+          coalesce_buf.clear();
+          coalesce_buf.shrink_to_fit();
+        }
+        while (more) {
+          PendingWrite *next = more->next;
+          more->ok = batch_ok;
+          more->done.store(true, std::memory_order_release);
+          more->done.notify_one();
+          more = next;
+        }
+      }
+    }
+    return self_ok;
   }
 
 public:

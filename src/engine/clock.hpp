@@ -2,8 +2,8 @@
 #define L3KV_ENGINE_CLOCK_HPP
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
-#include <mutex>
 
 
 namespace l3kv {
@@ -32,11 +32,24 @@ struct Timestamp {
 };
 
 class HybridLogicalClock {
-  mutable std::mutex mx_;
-  int64_t max_wall_time_{0};
-  uint32_t max_logical_{0};
+  static constexpr uint32_t kLogicalBits = 12;
+  static constexpr uint64_t kLogicalMask = (1ULL << kLogicalBits) - 1ULL;
+  static constexpr uint32_t kMaxLogical = static_cast<uint32_t>(kLogicalMask);
+
+  std::atomic<uint64_t> state_{0};
   uint32_t node_id_{0};
-  int64_t last_warn_phys_{0};
+  std::atomic<int64_t> last_warn_phys_{0};
+
+  static constexpr uint64_t pack(int64_t wall_time, uint32_t logical) noexcept {
+    return (static_cast<uint64_t>(wall_time) << kLogicalBits) |
+           (static_cast<uint64_t>(logical) & kLogicalMask);
+  }
+  static constexpr int64_t unpack_wall(uint64_t s) noexcept {
+    return static_cast<int64_t>(s >> kLogicalBits);
+  }
+  static constexpr uint32_t unpack_logical(uint64_t s) noexcept {
+    return static_cast<uint32_t>(s & kLogicalMask);
+  }
 
 public:
   explicit HybridLogicalClock(uint32_t node_id) : node_id_(node_id) {}
