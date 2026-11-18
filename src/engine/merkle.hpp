@@ -15,6 +15,7 @@
  */
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
@@ -45,10 +46,9 @@ private:
   static constexpr size_t L3_SIZE = 4096;
   static constexpr size_t SHARD_COUNT = 256;
 
-  std::vector<uint64_t> leaves_; // 65536
-  std::vector<uint64_t> l3_;     // 4096
-  std::vector<uint8_t>
-      l3_dirty_; // Use uint8_t for thread safety (avoid vector<bool>)
+  std::vector<std::atomic<uint64_t>> leaves_; // 65536
+  std::vector<uint64_t> l3_;                  // 4096
+  std::vector<std::atomic<uint8_t>> l3_dirty_;
 
   std::vector<uint64_t> l2_; // 256
   std::vector<uint8_t> l2_dirty_;
@@ -57,25 +57,23 @@ private:
   std::vector<uint64_t> l0_; // 1
   std::vector<uint8_t> l0_dirty_;
 
-  // Lock Hierarchy: global_mx_ -> shards_[i].mx
   mutable std::mutex global_mx_;
-  std::vector<std::unique_ptr<std::mutex>> shards_;
 
 public:
-  MerkleTree() {
-    leaves_.resize(L4_SIZE, 0);
+  MerkleTree() : leaves_(L4_SIZE), l3_dirty_(L3_SIZE) {
+    for (auto &leaf : leaves_) {
+      leaf.store(0, std::memory_order_relaxed);
+    }
+    for (auto &d : l3_dirty_) {
+      d.store(0, std::memory_order_relaxed);
+    }
     l3_.resize(L3_SIZE, 0);
-    l3_dirty_.resize(L3_SIZE, 0);
     l2_.resize(256, 0);
     l2_dirty_.resize(256, 0);
     l1_.resize(16, 0);
     l1_dirty_.resize(16, 0);
     l0_.resize(1, 0);
     l0_dirty_.resize(1, 0);
-
-    for (size_t i = 0; i < SHARD_COUNT; ++i) {
-      shards_.push_back(std::make_unique<std::mutex>());
-    }
 
     // Initialize tree to steady state (recursive hashes of 0)
     std::vector<uint64_t> zeros(16, 0);
@@ -98,11 +96,9 @@ public:
   void apply_delta(std::string_view key, uint64_t hash_delta) {
     uint64_t k_hash = fnv1a_64(key);
     uint32_t bucket_idx = (k_hash >> 48) & 0xFFFF; // 0..65535
-    size_t shard_idx = bucket_idx >> 8;            // 256 shards
 
-    std::lock_guard<std::mutex> lock(*shards_[shard_idx]);
-    leaves_[bucket_idx] ^= hash_delta;
-    l3_dirty_[bucket_idx >> 4] = 1;
+    leaves_[bucket_idx].fetch_xor(hash_delta, std::memory_order_release);
+    l3_dirty_[bucket_idx >> 4].store(1, std::memory_order_release);
   }
 
   uint64_t get_root_hash() {
@@ -125,26 +121,21 @@ public:
     if (level == 3)
       return l3_[index];
     if (level == 4)
-      return leaves_[index];
+      return leaves_[index].load(std::memory_order_acquire);
     return 0;
   }
 
 private:
   void recompute_dirty() {
-    // Phase 1: L3 from Leaves (Locking Shards sequentially)
-    for (size_t s = 0; s < SHARD_COUNT; ++s) {
-      std::lock_guard<std::mutex> slock(*shards_[s]);
-      size_t start_l3 = s * 16;
-      for (size_t i = 0; i < 16; ++i) {
-        size_t curr_l3 = start_l3 + i;
-        if (l3_dirty_[curr_l3]) {
-          uint64_t child_hashes[16];
-          for (int k = 0; k < 16; ++k)
-            child_hashes[k] = leaves_[curr_l3 * 16 + k];
-          l3_[curr_l3] = fnv1a_64(child_hashes, 16 * sizeof(uint64_t));
-          l3_dirty_[curr_l3] = 0;
-          l2_dirty_[curr_l3 >> 4] = 1;
-        }
+    // Phase 1: Lock-free L3 from atomic Leaves
+    for (size_t curr_l3 = 0; curr_l3 < L3_SIZE; ++curr_l3) {
+      if (l3_dirty_[curr_l3].exchange(0, std::memory_order_acq_rel) != 0) {
+        uint64_t child_hashes[16];
+        for (int k = 0; k < 16; ++k)
+          child_hashes[k] =
+              leaves_[curr_l3 * 16 + k].load(std::memory_order_acquire);
+        l3_[curr_l3] = fnv1a_64(child_hashes, 16 * sizeof(uint64_t));
+        l2_dirty_[curr_l3 >> 4] = 1;
       }
     }
 
