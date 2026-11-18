@@ -25,6 +25,7 @@ void ZmqServer::run() {
     // Set high-water marks to prevent memory ballooning
     socket.set(zmq::sockopt::sndhwm, 5000);
     socket.set(zmq::sockopt::rcvhwm, 5000);
+    socket.set(zmq::sockopt::rcvtimeo, 50);
 
     std::string endpoint = "tcp://" + address_ + ":" + std::to_string(port_);
     socket.bind(endpoint);
@@ -32,12 +33,13 @@ void ZmqServer::run() {
     std::cout << "[ZmqServer] Listening on " << endpoint << std::endl;
 
     running_ = true;
+    std::vector<zmq::message_t> recv_msgs;
+    recv_msgs.reserve(8);
     while (running_) {
-        std::vector<zmq::message_t> recv_msgs;
+        recv_msgs.clear();
         try {
-            auto result = zmq::recv_multipart(socket, std::back_inserter(recv_msgs), zmq::recv_flags::dontwait);
+            auto result = zmq::recv_multipart(socket, std::back_inserter(recv_msgs));
             if (!result) {
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
                 continue;
             }
 
@@ -112,7 +114,7 @@ void ZmqServer::run() {
             }
 
             if (opcode == 'G' && recv_msgs.size() >= 5) {
-                std::string key = recv_msgs[4].to_string();
+                std::string_view key(static_cast<const char*>(recv_msgs[4].data()), recv_msgs[4].size());
                 lite3cpp::Buffer val = engine_->get(key, current_uid);
                 
                 socket.send(identity, zmq::send_flags::sndmore);
@@ -145,8 +147,9 @@ void ZmqServer::run() {
             else if (opcode == 'M' && recv_msgs.size() >= 5) {
                 // MULTI-GET [Key1] [Key2] ...
                 std::vector<std::string> keys;
+                keys.reserve(recv_msgs.size() - 4);
                 for (size_t i = 4; i < recv_msgs.size(); ++i) {
-                    keys.push_back(recv_msgs[i].to_string());
+                    keys.emplace_back(static_cast<const char*>(recv_msgs[i].data()), recv_msgs[i].size());
                 }
 
                 lite3cpp::Buffer res_buf = engine_->batch_get(keys, current_uid);
@@ -157,8 +160,8 @@ void ZmqServer::run() {
             }
             else if (opcode == 'B' && recv_msgs.size() >= 5) {
                 auto& batch_msg = recv_msgs[4];
-                std::vector<uint8_t> vec((uint8_t*)batch_msg.data(), (uint8_t*)batch_msg.data() + batch_msg.size());
-                lite3cpp::Buffer batch_buf(std::move(vec));
+                lite3cpp::Buffer batch_buf = lite3cpp::Buffer::from_view(
+                    static_cast<const uint8_t*>(batch_msg.data()), batch_msg.size());
 
                 try {
                     engine_->batch_put(batch_buf, current_uid);
