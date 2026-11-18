@@ -468,8 +468,8 @@ void test_compact_wal_merkle_and_tombstones() {
     // Live keys and their :meta sidecars must still exist
     require_check(db2.get("live_0:meta").size() > 0, "live_0:meta must not be purged");
     root_after_zero_ttl_compact = db2.get_merkle_root_hash();
-    require_check(root_after_zero_ttl_compact != root_after_default_compact,
-                  "Purging tombstones with compact_wal(0) should update Merkle root");
+    require_check(root_after_zero_ttl_compact == root_after_default_compact,
+                  "Purging tombstones with compact_wal(0) should preserve live-key Merkle root");
   }
 
   {

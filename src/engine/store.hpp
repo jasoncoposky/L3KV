@@ -1,5 +1,6 @@
 #pragma once
 #include "KeyBuilder.hpp"
+#include "btree_map.hpp"
 #include "clock.hpp"
 #include "credential_manager.hpp"
 #include "merkle.hpp"
@@ -263,9 +264,12 @@ class Blob {
 public:
   lite3cpp::Buffer buf_;
   bool compressed_ = false;
+  bool is_tombstone_ = false;
+  bool has_hlc_ = false;
   uint32_t original_size_ = 0;
   uint64_t content_hash_ = 0;
   int64_t expires_at_us_ = 0;
+  Timestamp hlc_{0, 0, 0};
 
 public:
   static uint64_t non_zero_hash(const uint8_t *data, size_t len) noexcept {
@@ -278,6 +282,22 @@ public:
 
   bool is_expired(int64_t now_us) const noexcept {
     return expires_at_us_ > 0 && now_us >= expires_at_us_;
+  }
+
+  bool is_tombstone_expired(int64_t now_wall_us,
+                            uint64_t tombstone_ttl_ms) const noexcept {
+    if (!is_tombstone_) {
+      return false;
+    }
+    if (tombstone_ttl_ms == 0) {
+      return true;
+    }
+    if (!has_hlc_ || now_wall_us < hlc_.wall_time) {
+      return false;
+    }
+    uint64_t age_us = static_cast<uint64_t>(now_wall_us) -
+                      static_cast<uint64_t>(hlc_.wall_time);
+    return (age_us / 1000ULL) >= tombstone_ttl_ms;
   }
   Blob() = default;
 
@@ -434,7 +454,7 @@ class Engine {
 
   struct alignas(64) Shard {
     std::pmr::unsynchronized_pool_resource pool;
-    std::map<std::string, std::shared_ptr<const Blob>, std::less<>> map;
+    BTreeMap<std::string, std::shared_ptr<const Blob>, std::less<>> map;
 
     // Legacy async queue retained for submit_to_shard / submit_async callers
     moodycamel::BlockingConcurrentQueue<CoreMessage> messages;
@@ -652,7 +672,10 @@ private:
   }
 
   uint64_t hash_blob(const std::shared_ptr<const Blob> &blob) const noexcept {
-    return blob ? blob->content_hash() : 0;
+    if (!blob || blob->is_tombstone_) {
+      return 0;
+    }
+    return blob->content_hash();
   }
 
   static bool has_complete_routing_tag(std::string_view key) noexcept {
@@ -768,14 +791,17 @@ private:
   }
 
   void apply_patch_int_locked(Shard &s, std::string_view key,
-                              std::string_view field, int64_t val) {
+                              std::string_view field, int64_t val,
+                              Timestamp hlc = {0, 0, 0},
+                              bool has_hlc = false) {
     uint64_t old_h = 0;
     std::shared_ptr<Blob> new_blob;
     auto it = s.map.lower_bound(key);
     const bool found = (it != s.map.end() && it->first == key);
     if (found) {
       old_h = hash_blob(it->second);
-      if (it->second && it->second->buf_.size() > 0) {
+      if (it->second && it->second->buf_.size() > 0 &&
+          !it->second->is_tombstone_) {
         new_blob = std::make_shared<Blob>(*it->second);
       } else {
         new_blob = std::make_shared<Blob>(&s.pool, 0);
@@ -787,6 +813,11 @@ private:
     const bool is_meta = key.ends_with(":meta");
     if (!new_blob->set_int(field, val, zstd_manager_.get(), !is_meta)) {
       return;
+    }
+    new_blob->is_tombstone_ = false;
+    if (has_hlc) {
+      new_blob->hlc_ = hlc;
+      new_blob->has_hlc_ = true;
     }
     const uint64_t new_h = hash_blob(new_blob);
     if (found) {
@@ -800,14 +831,17 @@ private:
   }
 
   void apply_patch_str_locked(Shard &s, std::string_view key,
-                              std::string_view field, std::string_view val) {
+                              std::string_view field, std::string_view val,
+                              Timestamp hlc = {0, 0, 0},
+                              bool has_hlc = false) {
     uint64_t old_h = 0;
     std::shared_ptr<Blob> new_blob;
     auto it = s.map.lower_bound(key);
     const bool found = (it != s.map.end() && it->first == key);
     if (found) {
       old_h = hash_blob(it->second);
-      if (it->second && it->second->buf_.size() > 0) {
+      if (it->second && it->second->buf_.size() > 0 &&
+          !it->second->is_tombstone_) {
         new_blob = std::make_shared<Blob>(*it->second);
       } else {
         new_blob = std::make_shared<Blob>(&s.pool, 0);
@@ -820,6 +854,11 @@ private:
     if (!new_blob->set_str(field, val, zstd_manager_.get(), !is_meta)) {
       return;
     }
+    new_blob->is_tombstone_ = false;
+    if (has_hlc) {
+      new_blob->hlc_ = hlc;
+      new_blob->has_hlc_ = true;
+    }
     const uint64_t new_h = hash_blob(new_blob);
     if (found) {
       it->second = std::move(new_blob);
@@ -831,9 +870,27 @@ private:
     }
   }
 
-  bool apply_del_locked(Shard &s, std::string_view key) {
-    upsert_blob_locked(s, key, get_empty_blob());
-    return true;
+  bool apply_del_locked(Shard &s, std::string_view key,
+                        Timestamp hlc = {0, 0, 0}, bool has_hlc = false) {
+    auto it = s.map.lower_bound(key);
+    const bool found = (it != s.map.end() && it->first == key);
+    const bool existed = (found && it->second && !it->second->is_tombstone_ &&
+                          it->second->buf_.size() > 0);
+    uint64_t old_h = found ? hash_blob(it->second) : 0;
+    auto tomb = std::make_shared<Blob>();
+    tomb->is_tombstone_ = true;
+    tomb->has_hlc_ = has_hlc;
+    tomb->hlc_ = hlc;
+    const uint64_t new_h = hash_blob(tomb);
+    if (found) {
+      it->second = std::move(tomb);
+    } else {
+      s.map.emplace_hint(it, std::string(key), std::move(tomb));
+    }
+    if (old_h != new_h) {
+      merkle_.apply_delta(key, old_h ^ new_h);
+    }
+    return existed;
   }
 
   void apply_system_hooks(std::string_view key, std::string_view raw_input,
@@ -898,18 +955,58 @@ public:
   void apply_put(std::string_view key, std::string_view json_body) {
     const bool is_meta = key.ends_with(":meta");
     const bool is_sys = key.starts_with("sys:");
-    int64_t recovered_exp = 0;
     if (is_meta && key.size() > 5) {
       using namespace lite3cpp::literals;
       auto view_buf = lite3cpp::Buffer::from_view(
           reinterpret_cast<const uint8_t *>(json_body.data()),
           json_body.size());
+      int64_t recovered_exp = 0;
       if (auto exp = view_buf.try_get_i64(0, "exp"_hk); exp && *exp > 0) {
         recovered_exp = *exp;
       }
+      bool tomb = false;
+      if (auto tb = view_buf.try_get_bool(0, "tombstone"_hk)) {
+        tomb = *tb;
+      }
+      Timestamp ts{0, 0, 0};
+      bool has_ts = false;
+      if (auto wi = view_buf.try_get_i64(0, "ts"_hk)) {
+        ts.wall_time = *wi;
+        has_ts = true;
+      }
+      if (auto li = view_buf.try_get_i64(0, "l"_hk)) {
+        ts.logical = static_cast<uint32_t>(*li);
+      }
+      if (auto ni = view_buf.try_get_i64(0, "n"_hk)) {
+        ts.node_id = static_cast<uint32_t>(*ni);
+      }
+      std::string_view base = key.substr(0, key.size() - 5);
+      auto &bs = get_shard(base);
+      std::unique_lock<std::shared_mutex> lock(bs.read_mu);
+      if (auto it = bs.map.find(base); it != bs.map.end() && it->second) {
+        auto updated = std::make_shared<Blob>(*it->second);
+        if (recovered_exp > 0) {
+          updated->expires_at_us_ = recovered_exp;
+        }
+        if (has_ts) {
+          updated->hlc_ = ts;
+          updated->has_hlc_ = true;
+        }
+        if (tomb && updated->buf_.size() == 0) {
+          updated->is_tombstone_ = true;
+        }
+        upsert_blob_locked(bs, base, std::move(updated));
+      } else if (tomb) {
+        auto tb = std::make_shared<Blob>();
+        tb->is_tombstone_ = true;
+        tb->hlc_ = ts;
+        tb->has_hlc_ = has_ts;
+        upsert_blob_locked(bs, base, std::move(tb));
+      }
+      return;
     }
     auto new_blob = std::make_shared<Blob>(json_body, zstd_manager_.get(),
-                                           nullptr, !is_meta);
+                                           nullptr, true);
     std::shared_ptr<const Blob> sys_ref;
     if (is_sys) {
       sys_ref = new_blob;
@@ -919,17 +1016,6 @@ public:
     {
       std::unique_lock<std::shared_mutex> lock(s.read_mu);
       upsert_blob_locked(s, key, std::move(new_blob));
-    }
-    if (recovered_exp > 0) {
-      std::string_view base = key.substr(0, key.size() - 5);
-      auto &bs = get_shard(base);
-      std::unique_lock<std::shared_mutex> lock(bs.read_mu);
-      if (auto it = bs.map.find(base);
-          it != bs.map.end() && it->second && it->second->buf_.size() > 0) {
-        auto updated = std::make_shared<Blob>(*it->second);
-        updated->expires_at_us_ = recovered_exp;
-        it->second = std::move(updated);
-      }
     }
     if (is_sys && sys_ref) {
       apply_system_hooks(key, json_body, *sys_ref);
@@ -1000,7 +1086,8 @@ public:
       for (size_t i = 0; i < SHARDS; ++i) {
         auto &s = *shards_[i];
         for (auto it = s.map.begin(); it != s.map.end();) {
-          if (!it->second || it->second->buf_.size() == 0) {
+          if (!it->second ||
+              (!it->second->is_tombstone_ && it->second->buf_.size() == 0)) {
             if (it->second) {
               uint64_t h = hash_blob(it->second);
               if (h != 0) {
@@ -1104,12 +1191,34 @@ public:
   std::shared_ptr<const Blob> get_view(std::string_view key) {
     size_t h = get_routing_shard(key);
     auto &s = *shards_[h];
-    std::shared_lock<std::shared_mutex> lock(s.read_mu);
-    if (auto it = s.map.find(key); it != s.map.end()) {
-      if (it->second && it->second->is_expired(now_epoch_us())) {
-        return nullptr;
+    {
+      std::shared_lock<std::shared_mutex> lock(s.read_mu);
+      if (auto it = s.map.find(key); it != s.map.end()) {
+        if (it->second && it->second->is_expired(now_epoch_us())) {
+          return nullptr;
+        }
+        return it->second;
       }
-      return it->second;
+    }
+    if (key.size() > 5 && key.ends_with(":meta")) {
+      std::string_view base = key.substr(0, key.size() - 5);
+      size_t bh = get_routing_shard(base);
+      auto &bs = *shards_[bh];
+      std::shared_lock<std::shared_mutex> lock(bs.read_mu);
+      if (auto it = bs.map.find(base);
+          it != bs.map.end() && it->second &&
+          (it->second->has_hlc_ || it->second->is_tombstone_ ||
+           it->second->buf_.size() > 0)) {
+        auto &mbuf = format_meta_tl(it->second->hlc_, it->second->is_tombstone_,
+                                    it->second->expires_at_us_);
+        auto out = std::make_shared<Blob>();
+        out->buf_ = mbuf;
+        out->compressed_ = false;
+        out->original_size_ = static_cast<uint32_t>(out->buf_.size());
+        out->content_hash_ =
+            Blob::non_zero_hash(out->buf_.data(), out->buf_.size());
+        return out;
+      }
     }
     return nullptr;
   }
@@ -1124,6 +1233,23 @@ public:
     }
 
     auto view = get_view(key);
+    if ((!view || view->buf_.size() == 0) && key.size() > 5 &&
+        key.ends_with(":meta")) {
+      std::string_view base = key.substr(0, key.size() - 5);
+      auto bview = get_view(base);
+      if (bview && (bview->has_hlc_ || bview->is_tombstone_ ||
+                    bview->buf_.size() > 0)) {
+        auto &mbuf = format_meta_tl(bview->hlc_, bview->is_tombstone_,
+                                    bview->expires_at_us_);
+        auto out = std::make_shared<Blob>();
+        out->buf_ = mbuf;
+        out->compressed_ = false;
+        out->original_size_ = static_cast<uint32_t>(out->buf_.size());
+        out->content_hash_ =
+            Blob::non_zero_hash(out->buf_.data(), out->buf_.size());
+        return out;
+      }
+    }
     if (!view || view->buf_.size() == 0) {
       return nullptr;
     }
@@ -1154,6 +1280,16 @@ public:
     }
 
     auto view = get_view(key);
+    if ((!view || view->buf_.size() == 0) && key.size() > 5 &&
+        key.ends_with(":meta")) {
+      std::string_view base = key.substr(0, key.size() - 5);
+      auto bview = get_view(base);
+      if (bview && (bview->has_hlc_ || bview->is_tombstone_ ||
+                    bview->buf_.size() > 0)) {
+        return format_meta_tl(bview->hlc_, bview->is_tombstone_,
+                              bview->expires_at_us_);
+      }
+    }
     if (!view || view->buf_.size() == 0) {
       return {};
     }
@@ -1198,27 +1334,18 @@ public:
 
     std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
 
-    std::string_view mkey_v = KeyBuilder::meta_key(key);
     const size_t k_idx = get_routing_shard(key);
-    const size_t m_idx = get_routing_shard(mkey_v);
 
     {
-      ShardPairLock slk(shards_, k_idx, m_idx);
+      std::unique_lock<std::shared_mutex> slk(shards_[k_idx]->read_mu);
 
       auto now = next_timestamp();
-      auto &mbuf = format_meta_tl(now, false, expires_at_us);
-      std::string_view meta_sv(reinterpret_cast<const char *>(mbuf.data()),
-                               mbuf.size());
+      new_blob->hlc_ = now;
+      new_blob->has_hlc_ = true;
+      new_blob->is_tombstone_ = false;
 
-      thread_local std::vector<BatchOp> batch;
-      batch.clear();
-      batch.push_back({WalOp::PUT, key, json_body});
-      batch.push_back({WalOp::PUT, mkey_v, meta_sv});
-      wal_->append_batch(batch);
-
-      auto meta_blob = make_meta_blob(mbuf);
+      wal_->append(WalOp::PUT, key, json_body);
       upsert_blob_locked(*shards_[k_idx], key, std::move(new_blob));
-      upsert_blob_locked(*shards_[m_idx], mkey_v, std::move(meta_blob));
     }
 
     if (is_sys && sys_ref) {
@@ -1253,12 +1380,10 @@ public:
 
     std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
 
-    std::string_view mkey_v = KeyBuilder::meta_key(key);
     const size_t k_idx = get_routing_shard(key);
-    const size_t m_idx = get_routing_shard(mkey_v);
 
     {
-      ShardPairLock slk(shards_, k_idx, m_idx);
+      std::unique_lock<std::shared_mutex> slk(shards_[k_idx]->read_mu);
 
       auto &ks = *shards_[k_idx];
       uint64_t actual = 0;
@@ -1272,19 +1397,12 @@ public:
       }
 
       auto now = next_timestamp();
-      auto &mbuf = format_meta_tl(now, false, expires_at_us);
-      std::string_view meta_sv(reinterpret_cast<const char *>(mbuf.data()),
-                               mbuf.size());
+      new_blob->hlc_ = now;
+      new_blob->has_hlc_ = true;
+      new_blob->is_tombstone_ = false;
 
-      thread_local std::vector<BatchOp> batch;
-      batch.clear();
-      batch.push_back({WalOp::PUT, key, payload});
-      batch.push_back({WalOp::PUT, mkey_v, meta_sv});
-      wal_->append_batch(batch);
-
-      auto meta_blob = make_meta_blob(mbuf);
+      wal_->append(WalOp::PUT, key, payload);
       upsert_blob_locked(ks, key, std::move(new_blob));
-      upsert_blob_locked(*shards_[m_idx], mkey_v, std::move(meta_blob));
     }
 
     if (is_sys && sys_ref) {
@@ -1305,26 +1423,12 @@ public:
     std::string wal_patch = encode_wal_patch_i64(field, val);
     std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
 
-    std::string_view mkey_v = KeyBuilder::meta_key(key);
     const size_t k_idx = get_routing_shard(key);
-    const size_t m_idx = get_routing_shard(mkey_v);
-
-    ShardPairLock slk(shards_, k_idx, m_idx);
+    std::unique_lock<std::shared_mutex> slk(shards_[k_idx]->read_mu);
 
     auto now = next_timestamp();
-    auto &mbuf = format_meta_tl(now, false);
-    std::string_view meta_sv(reinterpret_cast<const char *>(mbuf.data()),
-                             mbuf.size());
-
-    thread_local std::vector<BatchOp> batch;
-    batch.clear();
-    batch.push_back({WalOp::PATCH_I64, key, wal_patch});
-    batch.push_back({WalOp::PUT, mkey_v, meta_sv});
-    wal_->append_batch(batch);
-
-    auto meta_blob = make_meta_blob(mbuf);
-    apply_patch_int_locked(*shards_[k_idx], key, field, val);
-    upsert_blob_locked(*shards_[m_idx], mkey_v, std::move(meta_blob));
+    wal_->append(WalOp::PATCH_I64, key, wal_patch);
+    apply_patch_int_locked(*shards_[k_idx], key, field, val, now, true);
   }
 
   void patch_str(std::string key, std::string field, std::string val,
@@ -1339,26 +1443,12 @@ public:
     std::string wal_patch = encode_wal_patch_str(field, val);
     std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
 
-    std::string_view mkey_v = KeyBuilder::meta_key(key);
     const size_t k_idx = get_routing_shard(key);
-    const size_t m_idx = get_routing_shard(mkey_v);
-
-    ShardPairLock slk(shards_, k_idx, m_idx);
+    std::unique_lock<std::shared_mutex> slk(shards_[k_idx]->read_mu);
 
     auto now = next_timestamp();
-    auto &mbuf = format_meta_tl(now, false);
-    std::string_view meta_sv(reinterpret_cast<const char *>(mbuf.data()),
-                             mbuf.size());
-
-    thread_local std::vector<BatchOp> batch;
-    batch.clear();
-    batch.push_back({WalOp::PATCH_STR, key, wal_patch});
-    batch.push_back({WalOp::PUT, mkey_v, meta_sv});
-    wal_->append_batch(batch);
-
-    auto meta_blob = make_meta_blob(mbuf);
-    apply_patch_str_locked(*shards_[k_idx], key, field, val);
-    upsert_blob_locked(*shards_[m_idx], mkey_v, std::move(meta_blob));
+    wal_->append(WalOp::PATCH_STR, key, wal_patch);
+    apply_patch_str_locked(*shards_[k_idx], key, field, val, now, true);
   }
 
   bool del(const std::string &key, uint32_t principal_id = ADMIN_UID) {
@@ -1371,27 +1461,12 @@ public:
 
     std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
 
-    std::string_view mkey_v = KeyBuilder::meta_key(key);
     const size_t k_idx = get_routing_shard(key);
-    const size_t m_idx = get_routing_shard(mkey_v);
-
-    ShardPairLock slk(shards_, k_idx, m_idx);
+    std::unique_lock<std::shared_mutex> slk(shards_[k_idx]->read_mu);
 
     auto now = next_timestamp();
-    auto &mbuf = format_meta_tl(now, true);
-    std::string_view meta_sv(reinterpret_cast<const char *>(mbuf.data()),
-                             mbuf.size());
-
-    thread_local std::vector<BatchOp> batch;
-    batch.clear();
-    batch.push_back({WalOp::DELETE_, key, ""});
-    batch.push_back({WalOp::PUT, mkey_v, meta_sv});
-    wal_->append_batch(batch);
-
-    auto meta_blob = make_meta_blob(mbuf);
-    bool existed = apply_del_locked(*shards_[k_idx], key);
-    upsert_blob_locked(*shards_[m_idx], mkey_v, std::move(meta_blob));
-    return existed;
+    wal_->append(WalOp::DELETE_, key, "");
+    return apply_del_locked(*shards_[k_idx], key, now, true);
   }
 
   void batch_put(const lite3cpp::Buffer &batch,
@@ -1437,14 +1512,11 @@ public:
       const bool is_meta = key_sv.ends_with(":meta");
       auto vblob = std::make_shared<Blob>(val_sv, zstd_manager_.get(), nullptr,
                                           !is_meta);
-      std::string mkey_s(KeyBuilder::meta_key(key_sv));
       const size_t k_idx = get_routing_shard(key_sv);
-      const size_t m_idx = get_routing_shard(mkey_s);
       touched[k_idx] = true;
-      touched[m_idx] = true;
 
-      prepared.push_back({key_sv, val_sv, std::move(mkey_s), std::move(vblob),
-                          nullptr, k_idx, m_idx});
+      prepared.push_back({key_sv, val_sv, std::string(), std::move(vblob),
+                          nullptr, k_idx, k_idx});
     }
 
     if (prepared.empty()) {
@@ -1470,16 +1542,13 @@ public:
       }
 
       std::vector<BatchOp> wal_batch;
-      wal_batch.reserve(prepared.size() * 2);
+      wal_batch.reserve(prepared.size());
       for (auto &item : prepared) {
         auto now = next_timestamp();
-        auto &mbuf = format_meta_tl(now, false);
-        item.meta_blob = make_meta_blob(mbuf);
+        item.val_blob->hlc_ = now;
+        item.val_blob->has_hlc_ = true;
+        item.val_blob->is_tombstone_ = false;
         wal_batch.push_back({WalOp::PUT, item.key, item.val});
-        std::string_view mval_sv(
-            reinterpret_cast<const char *>(item.meta_blob->buf_.data()),
-            item.meta_blob->buf_.size());
-        wal_batch.push_back({WalOp::PUT, item.mkey, mval_sv});
       }
 
       wal_->append_batch(wal_batch);
@@ -1490,8 +1559,6 @@ public:
         }
         upsert_blob_locked(*shards_[item.k_shard], item.key,
                            std::move(item.val_blob));
-        upsert_blob_locked(*shards_[item.m_shard], item.mkey,
-                           std::move(item.meta_blob));
       }
     }
 
@@ -1619,9 +1686,7 @@ public:
 
     std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
 
-    std::string_view mkey_v = KeyBuilder::meta_key(m.key);
     const size_t k_idx = get_routing_shard(m.key);
-    const size_t m_idx = get_routing_shard(mkey_v);
 
     std::shared_ptr<const Blob> sys_ref;
     const bool is_sys = (!m.is_delete && m.key.starts_with("sys:"));
@@ -1630,9 +1695,14 @@ public:
     }
 
     {
-      ShardPairLock slk(shards_, k_idx, m_idx);
+      std::unique_lock<std::shared_mutex> slk(shards_[k_idx]->read_mu);
 
-      Timestamp local_ts = read_meta_timestamp_locked(*shards_[m_idx], mkey_v);
+      Timestamp local_ts{0, 0, 0};
+      if (auto it = shards_[k_idx]->map.find(m.key);
+          it != shards_[k_idx]->map.end() && it->second &&
+          it->second->has_hlc_) {
+        local_ts = it->second->hlc_;
+      }
       if (m.timestamp <= local_ts) {
         std::cerr << "[Store] Rejecting mutation for " << m.key
                   << " (Stale). Inc: " << m.timestamp.wall_time
@@ -1640,28 +1710,16 @@ public:
         return;
       }
 
-      auto &mbuf = format_meta_tl(m.timestamp, m.is_delete);
-      std::string_view meta_sv(reinterpret_cast<const char *>(mbuf.data()),
-                               mbuf.size());
-
-      thread_local std::vector<BatchOp> wal_batch;
-      wal_batch.clear();
       if (m.is_delete) {
-        wal_batch.push_back({WalOp::DELETE_, m.key, ""});
+        wal_->append(WalOp::DELETE_, m.key, "");
+        apply_del_locked(*shards_[k_idx], m.key, m.timestamp, true);
       } else {
-        wal_batch.push_back({WalOp::PUT, m.key, val_sv});
-      }
-      wal_batch.push_back({WalOp::PUT, mkey_v, meta_sv});
-
-      wal_->append_batch(wal_batch);
-
-      auto meta_blob = make_meta_blob(mbuf);
-      if (m.is_delete) {
-        apply_del_locked(*shards_[k_idx], m.key);
-      } else {
+        prebuilt_val->hlc_ = m.timestamp;
+        prebuilt_val->has_hlc_ = true;
+        prebuilt_val->is_tombstone_ = false;
+        wal_->append(WalOp::PUT, m.key, val_sv);
         upsert_blob_locked(*shards_[k_idx], m.key, std::move(prebuilt_val));
       }
-      upsert_blob_locked(*shards_[m_idx], mkey_v, std::move(meta_blob));
     }
 
     if (is_sys && sys_ref) {
@@ -1687,10 +1745,9 @@ public:
     auto it = shards_[0]->map.begin();
     size_t live_keys = 0;
 
-    using MapIter = decltype(shards_[0]->map.begin());
     struct DeferredErasure {
       size_t shard;
-      MapIter it;
+      std::string key;
       uint64_t hash;
     };
     std::vector<DeferredErasure> deferred_erasures;
@@ -1703,9 +1760,38 @@ public:
           while (shard_idx < SHARDS) {
             auto &s = *shards_[shard_idx];
             while (it != s.map.end()) {
-              if (!it->second || it->second->buf_.size() == 0) {
-                uint64_t h = it->second ? hash_blob(it->second) : 0;
-                deferred_erasures.push_back({shard_idx, it, h});
+              if (!it->second) {
+                deferred_erasures.push_back({shard_idx, it->first, 0});
+                ++it;
+                continue;
+              }
+              if (it->second->is_tombstone_) {
+                if (it->second->is_tombstone_expired(now_wall_us,
+                                                     tombstone_ttl_ms)) {
+                  uint64_t h = hash_blob(it->second);
+                  deferred_erasures.push_back({shard_idx, it->first, h});
+                } else {
+                  auto &mbuf = format_meta_tl(it->second->hlc_, true,
+                                              it->second->expires_at_us_);
+                  std::string mkey = it->first + ":meta";
+                  std::string mval(
+                      reinterpret_cast<const char *>(mbuf.data()), mbuf.size());
+                  chunk_bytes += mkey.size() + mval.size() + 16;
+                  out_chunk.emplace_back(std::move(mkey), std::move(mval));
+                  ++live_keys;
+                  ++it;
+                  if (out_chunk.size() >= 5000 ||
+                      chunk_bytes >= 16ULL * 1024 * 1024) {
+                    return true;
+                  }
+                  continue;
+                }
+                ++it;
+                continue;
+              }
+              if (it->second->buf_.size() == 0) {
+                uint64_t h = hash_blob(it->second);
+                deferred_erasures.push_back({shard_idx, it->first, h});
                 ++it;
                 continue;
               }
@@ -1734,7 +1820,7 @@ public:
                      base_it->second->buf_.size() > 0);
                 if (!base_live) {
                   uint64_t h = hash_blob(it->second);
-                  deferred_erasures.push_back({shard_idx, it, h});
+                  deferred_erasures.push_back({shard_idx, it->first, h});
                   ++it;
                   continue;
                 }
@@ -1769,9 +1855,9 @@ public:
         }
         for (const auto &de : deferred_erasures) {
           if (de.hash != 0) {
-            merkle_.apply_delta(de.it->first, de.hash);
+            merkle_.apply_delta(de.key, de.hash);
           }
-          shards_[de.shard]->map.erase(de.it);
+          shards_[de.shard]->map.erase(de.key);
         }
       }
       std::fprintf(stderr,
@@ -2041,10 +2127,8 @@ public:
     size_t swept = 0;
     std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
     for (const auto &key : candidates) {
-      std::string_view mkey_v = KeyBuilder::meta_key(key);
       const size_t k_idx = get_routing_shard(key);
-      const size_t m_idx = get_routing_shard(mkey_v);
-      ShardPairLock slk(shards_, k_idx, m_idx);
+      std::unique_lock<std::shared_mutex> slk(shards_[k_idx]->read_mu);
       auto &ks = *shards_[k_idx];
       auto it = ks.map.find(key);
       if (it == ks.map.end() || !it->second || it->second->buf_.size() == 0 ||
@@ -2052,17 +2136,8 @@ public:
         continue;
       }
       auto now = next_timestamp();
-      auto &mbuf = format_meta_tl(now, true);
-      std::string_view meta_sv(reinterpret_cast<const char *>(mbuf.data()),
-                               mbuf.size());
-      thread_local std::vector<BatchOp> batch;
-      batch.clear();
-      batch.push_back({WalOp::DELETE_, key, ""});
-      batch.push_back({WalOp::PUT, mkey_v, meta_sv});
-      wal_->append_batch(batch);
-
-      apply_del_locked(ks, key);
-      upsert_blob_locked(*shards_[m_idx], mkey_v, make_meta_blob(mbuf));
+      wal_->append(WalOp::DELETE_, key, "");
+      apply_del_locked(ks, key, now, true);
       ++swept;
     }
     return swept;
