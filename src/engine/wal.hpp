@@ -52,17 +52,24 @@ struct LogHeader {
 #pragma pack(pop)
 
 namespace detail {
-inline constexpr std::array<uint32_t, 256> kCrc32Table = []() constexpr noexcept {
-  std::array<uint32_t, 256> table{};
-  for (uint32_t i = 0; i < 256; ++i) {
-    uint32_t c = i;
-    for (int j = 0; j < 8; ++j) {
-      c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
-    }
-    table[i] = c;
-  }
-  return table;
-}();
+inline constexpr std::array<std::array<uint32_t, 256>, 8> kCrc32Tables =
+    []() constexpr noexcept {
+      std::array<std::array<uint32_t, 256>, 8> tables{};
+      for (uint32_t i = 0; i < 256; ++i) {
+        uint32_t c = i;
+        for (int j = 0; j < 8; ++j) {
+          c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+        }
+        tables[0][i] = c;
+      }
+      for (size_t t = 1; t < 8; ++t) {
+        for (uint32_t i = 0; i < 256; ++i) {
+          uint32_t prev = tables[t - 1][i];
+          tables[t][i] = (prev >> 8) ^ tables[0][prev & 0xFFu];
+        }
+      }
+      return tables;
+    }();
 } // namespace detail
 
 class WriteAheadLog {
@@ -103,18 +110,9 @@ class WriteAheadLog {
 
   std::string path_;
   FileHandle file_;
+  static constexpr size_t kWriteBufFlushThreshold = 64 * 1024;
   mutable std::mutex write_mutex_;
-  std::mutex queue_mu_;
-  struct PendingWrite {
-    const void *data;
-    size_t len;
-    std::atomic<bool> done{false};
-    bool ok{false};
-    PendingWrite *next{nullptr};
-  };
-  PendingWrite *gc_head_{nullptr};
-  PendingWrite *gc_tail_{nullptr};
-  bool gc_active_{false};
+  std::vector<uint8_t> write_buf_;
   std::atomic<size_t> bytes_written_{0};
   std::atomic<size_t> bytes_read_{0};
   std::atomic<size_t> last_recovered_ops_{0};
@@ -125,8 +123,26 @@ class WriteAheadLog {
     uint32_t crc = 0xFFFFFFFFu;
     auto process = [&](const void *data, size_t len) noexcept {
       const auto *p = static_cast<const uint8_t *>(data);
-      for (size_t i = 0; i < len; ++i) {
-        crc = (crc >> 8) ^ detail::kCrc32Table[(crc ^ p[i]) & 0xFFu];
+      const auto &T = detail::kCrc32Tables;
+      while (len >= 8) {
+        uint32_t lo = 0, hi = 0;
+        std::memcpy(&lo, p, 4);
+        std::memcpy(&hi, p + 4, 4);
+        lo ^= crc;
+        crc = T[7][lo & 0xFFu] ^
+              T[6][(lo >> 8) & 0xFFu] ^
+              T[5][(lo >> 16) & 0xFFu] ^
+              T[4][lo >> 24] ^
+              T[3][hi & 0xFFu] ^
+              T[2][(hi >> 8) & 0xFFu] ^
+              T[1][(hi >> 16) & 0xFFu] ^
+              T[0][hi >> 24];
+        p += 8;
+        len -= 8;
+      }
+      while (len > 0) {
+        crc = (crc >> 8) ^ T[0][(crc ^ *p++) & 0xFFu];
+        --len;
       }
     };
     process(&op, sizeof(op));
@@ -168,107 +184,34 @@ class WriteAheadLog {
     return true;
   }
 
-  bool write_raw(const void* data, size_t len) {
+  bool flush_buffer_unlocked() {
+    if (write_buf_.empty()) return true;
+    const bool ok = write_raw_unlocked(write_buf_.data(), write_buf_.size());
+    if (ok) {
+      write_buf_.clear();
+    }
+    return ok;
+  }
+
+  bool write_raw(const void *data, size_t len) {
     if (!data || len == 0) return true;
-    PendingWrite self{data, len};
-    {
-      std::lock_guard<std::mutex> qlk(queue_mu_);
-      if (gc_active_) {
-        if (gc_tail_) {
-          gc_tail_->next = &self;
-        } else {
-          gc_head_ = &self;
-        }
-        gc_tail_ = &self;
-        // Wait outside queue_mu_
-      } else {
-        gc_active_ = true;
-        goto become_leader;
-      }
+    std::lock_guard<std::mutex> lock(write_mutex_);
+    if (len >= kWriteBufFlushThreshold) {
+      if (!flush_buffer_unlocked()) return false;
+      return write_raw_unlocked(data, len);
     }
-    self.done.wait(false, std::memory_order_acquire);
-    return self.ok;
-
-  become_leader:
-    bool self_ok = false;
-    {
-      std::lock_guard<std::mutex> wlk(write_mutex_);
-      // Drain any followers that arrived while we acquired write_mutex_
-      PendingWrite *batch = nullptr;
-      {
-        std::lock_guard<std::mutex> qlk(queue_mu_);
-        batch = gc_head_;
-        gc_head_ = nullptr;
-        gc_tail_ = nullptr;
-      }
-
-      if (!batch) {
-        self_ok = write_raw_unlocked(data, len);
-      } else {
-        thread_local std::vector<uint8_t> coalesce_buf;
-        coalesce_buf.clear();
-        coalesce_buf.insert(coalesce_buf.end(),
-                            static_cast<const uint8_t *>(data),
-                            static_cast<const uint8_t *>(data) + len);
-        for (PendingWrite *cur = batch; cur; cur = cur->next) {
-          const auto *p = static_cast<const uint8_t *>(cur->data);
-          coalesce_buf.insert(coalesce_buf.end(), p, p + cur->len);
-        }
-        self_ok = write_raw_unlocked(coalesce_buf.data(), coalesce_buf.size());
-        if (coalesce_buf.capacity() > 16ULL * 1024 * 1024 &&
-            coalesce_buf.size() < 65536) {
-          coalesce_buf.clear();
-          coalesce_buf.shrink_to_fit();
-        }
-        while (batch) {
-          PendingWrite *next = batch->next;
-          batch->ok = self_ok;
-          batch->done.store(true, std::memory_order_release);
-          batch->done.notify_one();
-          batch = next;
-        }
-      }
-
-      // Drain any remaining followers that arrived during the syscall
-      for (;;) {
-        PendingWrite *more = nullptr;
-        {
-          std::lock_guard<std::mutex> qlk(queue_mu_);
-          more = gc_head_;
-          gc_head_ = nullptr;
-          gc_tail_ = nullptr;
-          if (!more) {
-            gc_active_ = false;
-            break;
-          }
-        }
-        thread_local std::vector<uint8_t> coalesce_buf;
-        coalesce_buf.clear();
-        for (PendingWrite *cur = more; cur; cur = cur->next) {
-          const auto *p = static_cast<const uint8_t *>(cur->data);
-          coalesce_buf.insert(coalesce_buf.end(), p, p + cur->len);
-        }
-        bool batch_ok = write_raw_unlocked(coalesce_buf.data(), coalesce_buf.size());
-        if (coalesce_buf.capacity() > 16ULL * 1024 * 1024 &&
-            coalesce_buf.size() < 65536) {
-          coalesce_buf.clear();
-          coalesce_buf.shrink_to_fit();
-        }
-        while (more) {
-          PendingWrite *next = more->next;
-          more->ok = batch_ok;
-          more->done.store(true, std::memory_order_release);
-          more->done.notify_one();
-          more = next;
-        }
-      }
+    if (write_buf_.size() + len > kWriteBufFlushThreshold) {
+      if (!flush_buffer_unlocked()) return false;
     }
-    return self_ok;
+    const auto *p = static_cast<const uint8_t *>(data);
+    write_buf_.insert(write_buf_.end(), p, p + len);
+    return true;
   }
 
 public:
   explicit WriteAheadLog(std::string path)
       : path_(std::move(path)), file_(path_) {
+    write_buf_.reserve(kWriteBufFlushThreshold);
 #ifdef _WIN32
     SetFilePointer(file_.h, 0, NULL, FILE_END);
 #else
@@ -280,7 +223,8 @@ public:
     flush();
   }
 
-  void append(WalOp op, std::string_view key, std::string_view payload) {
+  static void encode_record(std::vector<uint8_t> &out, WalOp op,
+                            std::string_view key, std::string_view payload) {
     if (key.size() > UINT16_MAX) {
       throw std::invalid_argument("WAL key size exceeds UINT16_MAX");
     }
@@ -290,10 +234,9 @@ public:
 
     uint32_t crc = compute_crc(static_cast<uint8_t>(op), key, payload);
     size_t total_len = sizeof(LogHeader) + key.size() + payload.size();
-
-    thread_local std::vector<uint8_t> buffer;
-    buffer.resize(total_len);
-    uint8_t *ptr = buffer.data();
+    size_t old_size = out.size();
+    out.resize(old_size + total_len);
+    uint8_t *ptr = out.data() + old_size;
 
     LogHeader h{crc, static_cast<uint8_t>(op),
                 static_cast<uint16_t>(key.size()),
@@ -305,10 +248,23 @@ public:
       std::memcpy(ptr, key.data(), key.size());
       ptr += key.size();
     }
-
     if (!payload.empty()) {
       std::memcpy(ptr, payload.data(), payload.size());
     }
+  }
+
+  void append_prebuilt(const void *data, size_t len) {
+    if (!data || len == 0) return;
+    if (!write_raw(data, len)) {
+      throw std::runtime_error("WAL write_raw failed in append_prebuilt");
+    }
+  }
+
+  void append(WalOp op, std::string_view key, std::string_view payload) {
+    thread_local std::vector<uint8_t> buffer;
+    buffer.clear();
+    encode_record(buffer, op, key, payload);
+    const size_t total_len = buffer.size();
 
     if (!write_raw(buffer.data(), buffer.size())) {
       throw std::runtime_error("WAL write_raw failed in append");
@@ -391,6 +347,10 @@ public:
       std::function<void(WalOp, std::string_view, std::string_view)>;
 
   void recover(RecoverCallback callback) {
+    {
+      std::lock_guard<std::mutex> lock(write_mutex_);
+      flush_buffer_unlocked();
+    }
     uint64_t fileSize64 = 0;
 #ifdef _WIN32
     LARGE_INTEGER fileSize;
@@ -527,12 +487,12 @@ public:
 #ifdef _WIN32
     LARGE_INTEGER fileSize;
     if (!GetFileSizeEx(file_.h, &fileSize)) return 0;
-    return static_cast<uint64_t>(fileSize.QuadPart);
+    return static_cast<uint64_t>(fileSize.QuadPart) + write_buf_.size();
 #else
     if (file_.fd < 0) return 0;
     struct stat st;
     if (fstat(file_.fd, &st) < 0) return 0;
-    return static_cast<uint64_t>(st.st_size);
+    return static_cast<uint64_t>(st.st_size) + write_buf_.size();
 #endif
   }
 
@@ -669,6 +629,7 @@ public:
       close(file_.fd);
     }
     file_.fd = new_fd;
+    write_buf_.clear();
 
     auto parent = std::filesystem::path(path_).parent_path();
     if (parent.empty()) parent = ".";
@@ -702,6 +663,7 @@ public:
 
   void flush() {
     std::lock_guard<std::mutex> lock(write_mutex_);
+    flush_buffer_unlocked();
 #ifdef _WIN32
     FlushFileBuffers(file_.h);
 #else

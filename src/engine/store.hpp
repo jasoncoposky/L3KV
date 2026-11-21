@@ -461,9 +461,31 @@ class Engine {
     std::atomic<bool> stop_flag{false};
     std::thread core_thread;
 
-    Shard() : pool(std::pmr::new_delete_resource()) {}
+    Shard() : pool(std::pmr::new_delete_resource()) {
+      wal_buf.reserve(64 * 1024);
+    }
+    mutable std::mutex write_mu;
     mutable std::shared_mutex read_mu;
+    std::vector<uint8_t> wal_buf;
   };
+
+  static constexpr size_t kShardWalFlushBytes = 64 * 1024;
+
+  void append_wal_shard_locked(Shard &s, WalOp op, std::string_view key,
+                               std::string_view payload) {
+    WriteAheadLog::encode_record(s.wal_buf, op, key, payload);
+    if (s.wal_buf.size() >= kShardWalFlushBytes) {
+      wal_->append_prebuilt(s.wal_buf.data(), s.wal_buf.size());
+      s.wal_buf.clear();
+    }
+  }
+
+  void flush_shard_wal_locked(Shard &s) {
+    if (!s.wal_buf.empty()) {
+      wal_->append_prebuilt(s.wal_buf.data(), s.wal_buf.size());
+      s.wal_buf.clear();
+    }
+  }
 
   struct ShardPairLock {
     std::unique_lock<std::shared_mutex> lk1;
@@ -497,7 +519,6 @@ class Engine {
   MerkleTree merkle_;
   std::unique_ptr<ZstdManager> zstd_manager_;
   std::unique_ptr<CredentialManager> credentials_;
-  mutable std::shared_mutex compaction_mu_;
 
 public:
   CredentialManager &credentials() { return *credentials_; }
@@ -787,6 +808,25 @@ private:
     }
     if (old_h != new_h) {
       merkle_.apply_delta(key, old_h ^ new_h);
+    }
+  }
+
+  void upsert_blob_locked(Shard &s, std::string &&key,
+                          std::shared_ptr<const Blob> new_blob) {
+    uint64_t old_h = 0;
+    const uint64_t new_h = hash_blob(new_blob);
+    auto it = s.map.lower_bound(key);
+    if (it != s.map.end() && it->first == key) {
+      old_h = hash_blob(it->second);
+      it->second = std::move(new_blob);
+      if (old_h != new_h) {
+        merkle_.apply_delta(key, old_h ^ new_h);
+      }
+    } else {
+      auto inserted = s.map.emplace_hint(it, std::move(key), std::move(new_blob));
+      if (old_h != new_h) {
+        merkle_.apply_delta(inserted->first, old_h ^ new_h);
+      }
     }
   }
 
@@ -1146,6 +1186,15 @@ public:
         shards_[i]->core_thread.join();
       }
     }
+    if (wal_) {
+      for (size_t i = 0; i < SHARDS; ++i) {
+        try {
+          std::lock_guard<std::mutex> wlk(shards_[i]->write_mu);
+          flush_shard_wal_locked(*shards_[i]);
+        } catch (...) {
+        }
+      }
+    }
   }
 
   Shard &get_shard_by_index(size_t index) { return *shards_[index]; }
@@ -1332,11 +1381,10 @@ public:
       sys_ref = new_blob;
     }
 
-    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
-
     const size_t k_idx = get_routing_shard(key);
 
     {
+      std::lock_guard<std::mutex> wlk(shards_[k_idx]->write_mu);
       std::unique_lock<std::shared_mutex> slk(shards_[k_idx]->read_mu);
 
       auto now = next_timestamp();
@@ -1344,8 +1392,14 @@ public:
       new_blob->has_hlc_ = true;
       new_blob->is_tombstone_ = false;
 
-      wal_->append(WalOp::PUT, key, json_body);
-      upsert_blob_locked(*shards_[k_idx], key, std::move(new_blob));
+      append_wal_shard_locked(*shards_[k_idx], WalOp::PUT, key, json_body);
+      if (is_sys) {
+        upsert_blob_locked(*shards_[k_idx], std::string_view(key),
+                           std::move(new_blob));
+      } else {
+        upsert_blob_locked(*shards_[k_idx], std::move(key),
+                           std::move(new_blob));
+      }
     }
 
     if (is_sys && sys_ref) {
@@ -1378,11 +1432,10 @@ public:
       sys_ref = new_blob;
     }
 
-    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
-
     const size_t k_idx = get_routing_shard(key);
 
     {
+      std::lock_guard<std::mutex> wlk(shards_[k_idx]->write_mu);
       std::unique_lock<std::shared_mutex> slk(shards_[k_idx]->read_mu);
 
       auto &ks = *shards_[k_idx];
@@ -1401,7 +1454,7 @@ public:
       new_blob->has_hlc_ = true;
       new_blob->is_tombstone_ = false;
 
-      wal_->append(WalOp::PUT, key, payload);
+      append_wal_shard_locked(*shards_[k_idx], WalOp::PUT, key, payload);
       upsert_blob_locked(ks, key, std::move(new_blob));
     }
 
@@ -1421,13 +1474,13 @@ public:
     }
 
     std::string wal_patch = encode_wal_patch_i64(field, val);
-    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
 
     const size_t k_idx = get_routing_shard(key);
+    std::lock_guard<std::mutex> wlk(shards_[k_idx]->write_mu);
     std::unique_lock<std::shared_mutex> slk(shards_[k_idx]->read_mu);
 
     auto now = next_timestamp();
-    wal_->append(WalOp::PATCH_I64, key, wal_patch);
+    append_wal_shard_locked(*shards_[k_idx], WalOp::PATCH_I64, key, wal_patch);
     apply_patch_int_locked(*shards_[k_idx], key, field, val, now, true);
   }
 
@@ -1441,13 +1494,13 @@ public:
     }
 
     std::string wal_patch = encode_wal_patch_str(field, val);
-    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
 
     const size_t k_idx = get_routing_shard(key);
+    std::lock_guard<std::mutex> wlk(shards_[k_idx]->write_mu);
     std::unique_lock<std::shared_mutex> slk(shards_[k_idx]->read_mu);
 
     auto now = next_timestamp();
-    wal_->append(WalOp::PATCH_STR, key, wal_patch);
+    append_wal_shard_locked(*shards_[k_idx], WalOp::PATCH_STR, key, wal_patch);
     apply_patch_str_locked(*shards_[k_idx], key, field, val, now, true);
   }
 
@@ -1459,13 +1512,12 @@ public:
       }
     }
 
-    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
-
     const size_t k_idx = get_routing_shard(key);
+    std::lock_guard<std::mutex> wlk(shards_[k_idx]->write_mu);
     std::unique_lock<std::shared_mutex> slk(shards_[k_idx]->read_mu);
 
     auto now = next_timestamp();
-    wal_->append(WalOp::DELETE_, key, "");
+    append_wal_shard_locked(*shards_[k_idx], WalOp::DELETE_, key, "");
     return apply_del_locked(*shards_[k_idx], key, now, true);
   }
 
@@ -1531,10 +1583,15 @@ public:
     std::vector<PendingSysHook> sys_hooks;
 
     {
-      std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
-
+      std::vector<std::unique_lock<std::mutex>> write_locks;
+      write_locks.reserve(SHARDS);
       std::vector<std::unique_lock<std::shared_mutex>> shard_locks;
       shard_locks.reserve(SHARDS);
+      for (size_t i = 0; i < SHARDS; ++i) {
+        if (touched[i]) {
+          write_locks.emplace_back(shards_[i]->write_mu);
+        }
+      }
       for (size_t i = 0; i < SHARDS; ++i) {
         if (touched[i]) {
           shard_locks.emplace_back(shards_[i]->read_mu);
@@ -1551,6 +1608,11 @@ public:
         wal_batch.push_back({WalOp::PUT, item.key, item.val});
       }
 
+      for (size_t i = 0; i < SHARDS; ++i) {
+        if (touched[i]) {
+          flush_shard_wal_locked(*shards_[i]);
+        }
+      }
       wal_->append_batch(wal_batch);
 
       for (auto &item : prepared) {
@@ -1647,7 +1709,11 @@ public:
       prepared_shards.push_back(std::move(pso));
     }
 
-    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
+    std::vector<std::unique_lock<std::mutex>> write_locks;
+    write_locks.reserve(prepared_shards.size());
+    for (const auto &pso : prepared_shards) {
+      write_locks.emplace_back(shards_[pso.shard_idx]->write_mu);
+    }
 
     std::vector<std::unique_lock<std::shared_mutex>> shard_locks;
     shard_locks.reserve(prepared_shards.size());
@@ -1656,6 +1722,9 @@ public:
     }
 
     if (!wal_ops.empty() && wal_) {
+      for (const auto &pso : prepared_shards) {
+        flush_shard_wal_locked(*shards_[pso.shard_idx]);
+      }
       wal_->append_batch(wal_ops);
     }
 
@@ -1684,8 +1753,6 @@ public:
                                             nullptr, !is_meta);
     }
 
-    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
-
     const size_t k_idx = get_routing_shard(m.key);
 
     std::shared_ptr<const Blob> sys_ref;
@@ -1695,6 +1762,7 @@ public:
     }
 
     {
+      std::lock_guard<std::mutex> wlk(shards_[k_idx]->write_mu);
       std::unique_lock<std::shared_mutex> slk(shards_[k_idx]->read_mu);
 
       Timestamp local_ts{0, 0, 0};
@@ -1711,13 +1779,13 @@ public:
       }
 
       if (m.is_delete) {
-        wal_->append(WalOp::DELETE_, m.key, "");
+        append_wal_shard_locked(*shards_[k_idx], WalOp::DELETE_, m.key, "");
         apply_del_locked(*shards_[k_idx], m.key, m.timestamp, true);
       } else {
         prebuilt_val->hlc_ = m.timestamp;
         prebuilt_val->has_hlc_ = true;
         prebuilt_val->is_tombstone_ = false;
-        wal_->append(WalOp::PUT, m.key, val_sv);
+        append_wal_shard_locked(*shards_[k_idx], WalOp::PUT, m.key, val_sv);
         upsert_blob_locked(*shards_[k_idx], m.key, std::move(prebuilt_val));
       }
     }
@@ -1729,7 +1797,14 @@ public:
 
   void set_logger(std::shared_ptr<ILogger> logger) { logger_ = logger; }
   ZstdManager *get_zstd_manager() const { return zstd_manager_.get(); }
-  void flush() { wal_->flush(); }
+  void flush() {
+    if (!wal_) return;
+    for (size_t i = 0; i < SHARDS; ++i) {
+      std::lock_guard<std::mutex> wlk(shards_[i]->write_mu);
+      flush_shard_wal_locked(*shards_[i]);
+    }
+    wal_->flush();
+  }
 
   bool compact_wal_unlocked(
       uint64_t tombstone_ttl_ms = 24ULL * 3600ULL * 1000ULL,
@@ -1874,7 +1949,12 @@ public:
     if (!wal_) {
       return false;
     }
-    std::unique_lock<std::shared_mutex> comp_lk(compaction_mu_);
+    std::vector<std::unique_lock<std::mutex>> write_locks;
+    write_locks.reserve(SHARDS);
+    for (size_t i = 0; i < SHARDS; ++i) {
+      write_locks.emplace_back(shards_[i]->write_mu);
+      flush_shard_wal_locked(*shards_[i]);
+    }
     wait_all_shards();
     std::vector<std::shared_lock<std::shared_mutex>> read_locks;
     read_locks.reserve(SHARDS);
@@ -2192,9 +2272,9 @@ public:
     }
 
     size_t swept = 0;
-    std::shared_lock<std::shared_mutex> comp_lk(compaction_mu_);
     for (const auto &key : candidates) {
       const size_t k_idx = get_routing_shard(key);
+      std::lock_guard<std::mutex> wlk(shards_[k_idx]->write_mu);
       std::unique_lock<std::shared_mutex> slk(shards_[k_idx]->read_mu);
       auto &ks = *shards_[k_idx];
       auto it = ks.map.find(key);
@@ -2203,7 +2283,7 @@ public:
         continue;
       }
       auto now = next_timestamp();
-      wal_->append(WalOp::DELETE_, key, "");
+      append_wal_shard_locked(*shards_[k_idx], WalOp::DELETE_, key, "");
       apply_del_locked(ks, key, now, true);
       ++swept;
     }
