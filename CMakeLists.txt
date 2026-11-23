@@ -87,6 +87,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_library(l3kv_engine STATIC
     src/engine/clock.cpp
     src/engine/mesh.cpp
+    src/engine/store.cpp
     src/observability/simple_metrics.cpp
 )
 
