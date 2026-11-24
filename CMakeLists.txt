@@ -7,7 +7,10 @@ endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+
+option(L3KV_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
 # Dependencies
 find_package(Threads REQUIRED)
@@ -106,6 +109,11 @@ target_link_libraries(l3kv_engine PUBLIC
 )
 if(NOT MSVC)
     target_compile_options(l3kv_engine PUBLIC $<$<CONFIG:Release,RelWithDebInfo>:-O3>)
+    target_compile_options(l3kv_engine PRIVATE -Wall -Wextra)
+    if(L3KV_ENABLE_SANITIZERS)
+        target_compile_options(l3kv_engine PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(l3kv_engine PUBLIC -fsanitize=address,undefined)
+    endif()
 endif()
 
 add_executable(l3svc

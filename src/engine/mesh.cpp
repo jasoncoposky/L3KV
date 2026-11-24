@@ -8,7 +8,7 @@
 
 namespace l3kv {
 
-static std::string lane_to_string(Lane l) {
+[[maybe_unused]] static std::string lane_to_string(Lane l) {
   switch (l) {
   case Lane::Control:
     return "control";
@@ -188,7 +188,7 @@ void Mesh::listen() { do_accept(); }
 
 void Mesh::do_accept() {
   acceptor_.async_accept([this](boost::system::error_code ec,
-                                boost::asio::ip::tcp::socket socket) {
+                                boost::asio::ip::tcp::socket /*socket*/) {
     if (!ec) {
       // ... (existing logic)
     } else {
