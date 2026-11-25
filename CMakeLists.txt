@@ -11,6 +11,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
 option(L3KV_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(L3KV_ENABLE_TSAN "Enable ThreadSanitizer" OFF)
 
 # Dependencies
 find_package(Threads REQUIRED)
@@ -113,6 +114,9 @@ if(NOT MSVC)
     if(L3KV_ENABLE_SANITIZERS)
         target_compile_options(l3kv_engine PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
         target_link_options(l3kv_engine PUBLIC -fsanitize=address,undefined)
+    elseif(L3KV_ENABLE_TSAN)
+        target_compile_options(l3kv_engine PUBLIC -fsanitize=thread -fno-omit-frame-pointer)
+        target_link_options(l3kv_engine PUBLIC -fsanitize=thread)
     endif()
 endif()
 
@@ -246,6 +250,14 @@ target_link_libraries(test_sync_latency PRIVATE
     l3kv_engine
 )
 add_test(NAME test_sync_latency COMMAND test_sync_latency)
+
+set_tests_properties(
+    test_phase2
+    test_mesh_stress
+    test_sync_simulation
+    test_sync_latency
+    PROPERTIES RESOURCE_LOCK l3kv_net_ports
+)
 
 add_executable(bench_twitter src/tests_cpp/bench_twitter.cpp)
 target_include_directories(bench_twitter PRIVATE

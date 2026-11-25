@@ -1,0 +1,76 @@
+name: CI (Build, Test, Sanitizers, Static Analysis)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  build-test:
+    name: Release Build & Test (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout L3KV
+        uses: actions/checkout@v4
+        with:
+          path: L3KV
+
+      - name: Checkout sibling dependencies
+        run: |
+          mkdir -p lib
+          git clone --depth 1 "https://github.com/${{ github.repository_owner }}/lite3-cpp.git" lib/lite3-cpp
+          git clone --depth 1 "https://github.com/${{ github.repository_owner }}/liblite3client.git" lib/liblite3client
+          git clone --depth 1 https://github.com/ibireme/yyjson.git yyjson
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libzmq3-dev libboost-all-dev libssl-dev
+
+      - name: Configure & Build
+        run: |
+          cmake -S L3KV -B L3KV/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build L3KV/build -j$(nproc)
+
+      - name: Run CTest
+        run: ctest --test-dir L3KV/build --output-on-failure -j$(nproc)
+
+  sanitizers:
+    name: ASan + UBSan (Ubuntu 24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout L3KV
+        uses: actions/checkout@v4
+        with:
+          path: L3KV
+
+      - name: Checkout sibling dependencies
+        run: |
+          mkdir -p lib
+          git clone --depth 1 "https://github.com/${{ github.repository_owner }}/lite3-cpp.git" lib/lite3-cpp
+          git clone --depth 1 "https://github.com/${{ github.repository_owner }}/liblite3client.git" lib/liblite3client
+          git clone --depth 1 https://github.com/ibireme/yyjson.git yyjson
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config \
+            libzmq3-dev libboost-all-dev libssl-dev
+
+      - name: Build & Test Core Engine (ASan + UBSan)
+        env:
+          ASAN_OPTIONS: "detect_leaks=0:halt_on_error=1"
+          UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+        run: |
+          cmake -S L3KV -B L3KV/build-asan -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DL3KV_ENABLE_SANITIZERS=ON
+          cmake --build L3KV/build-asan -j$(nproc) --target test_clock test_wal test_store test_cas_ttl test_merkle test_credentials
+          ctest --test-dir L3KV/build-asan -R '^(test_clock|test_wal|test_store|test_cas_ttl|test_merkle|test_credentials)$' --output-on-failure
